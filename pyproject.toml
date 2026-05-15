@@ -55,7 +55,10 @@ branch = true
 show_missing = true
 
 [tool.cibuildwheel]
+# 64-bit only: QuickJS is built with the 64-bit mingw-w64 toolchain on
+# Windows, which cannot target 32-bit (win32 / i686).
 build = "cp39-* cp311-* cp313-*"
-skip = "*-musllinux_* *_i686"
+archs = ["auto64"]
+skip = "*-musllinux_*"
 test-requires = "pytest"
 test-command = "pytest {project}/tests -q"
