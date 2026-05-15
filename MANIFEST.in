@@ -1,0 +1,16 @@
+include LICENSE
+include README.md
+include CLAUDE.md
+include TODO.md
+include setup.py
+include pyproject.toml
+
+# Vendored QuickJS engine sources, required to build the C extension.
+recursive-include vendor/quickjs *.c *.h
+include vendor/quickjs/LICENSE
+include vendor/quickjs/VERSION
+
+# C extension source and type stubs.
+include src/quickjs/_quickjs.c
+include src/quickjs/_quickjs.pyi
+include src/quickjs/py.typed

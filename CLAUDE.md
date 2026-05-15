@@ -4,9 +4,10 @@ This file guides Claude Code (and human contributors) when working in this repos
 
 ## Project: quickjs-py
 
-Python bindings for [QuickJS](https://github.com/quickjs-ng/quickjs), a small and
-embeddable JavaScript engine. The goal is to expose the **full QuickJS C API** to
-Python, while also providing an ergonomic high-level interface.
+Python bindings for [QuickJS](https://github.com/bellard/quickjs), Fabrice
+Bellard's small and embeddable JavaScript engine. The goal is to expose the
+**full QuickJS C API** to Python, while also providing an ergonomic high-level
+interface.
 
 ### Goals
 
@@ -33,14 +34,12 @@ quickjs-py/
 ├── src/
 │   └── quickjs/
 │       ├── __init__.py  # public package API
+│       ├── _quickjs.c   # C extension: Runtime/Context/Value wrappers
+│       ├── _quickjs.pyi # type stubs for the C extension
 │       ├── _quickjs.*.so / .pyd   # compiled C extension (built)
-│       ├── _quickjs.c   # C extension: raw 1:1 bindings to QuickJS C API
-│       ├── runtime.py   # high-level Runtime wrapper
-│       ├── context.py   # high-level Context wrapper
-│       ├── errors.py     # JSException and friends
-│       └── _typeconv.py # Python <-> JSValue conversion helpers
+│       └── py.typed     # PEP 561 marker
 └── tests/
-    ├── test_raw_api.py  # raw C API coverage
+    ├── conftest.py
     ├── test_runtime.py
     ├── test_context.py
     ├── test_eval.py
@@ -50,17 +49,25 @@ quickjs-py/
 
 ### Layers
 
-- **Raw layer** (`_quickjs` C extension): thin 1:1 wrappers around QuickJS C
-  functions. Names mirror QuickJS (`JS_NewRuntime`, `JS_Eval`, ...). Memory and
-  refcount semantics are exposed; callers are responsible for `JS_FreeValue`.
-- **High-level layer** (`runtime.py`, `context.py`): RAII-style objects that own
-  runtimes/contexts, handle refcounting, convert types automatically, and raise
-  `JSException` on JS errors.
+- **C extension** (`_quickjs`): object-oriented wrappers around the QuickJS C
+  API exposed as three types — `Runtime`, `Context`, `Value`. The extension
+  owns exactly one JS reference per `Value` and frees it on deallocation, so
+  callers never deal with `JS_FreeValue` directly. It performs automatic
+  Python <-> JS type conversion and raises `JSError` when JS throws.
+- **Public package** (`quickjs/__init__.py`): re-exports the C types and adds
+  convenience helpers (e.g. the top-level `eval()`).
+
+Ownership chain: `Value` holds a reference to its `Context`, which holds a
+reference to its `Runtime`. This guarantees the engine outlives every value
+derived from it, so teardown order is always correct.
 
 ## Engine choice
 
-Use **quickjs-ng** (the actively maintained fork). Vendor it as a git submodule
-under `vendor/quickjs` pinned to a known-good tag.
+Use **Bellard's upstream QuickJS** (https://github.com/bellard/quickjs). The
+engine sources are vendored directly under `vendor/quickjs` (not a submodule)
+so that the sdist is fully self-contained. Compiled translation units:
+`quickjs.c`, `libregexp.c`, `libunicode.c`, `cutils.c`, `dtoa.c`. The engine
+version is read from `vendor/quickjs/VERSION` and passed as `CONFIG_VERSION`.
 
 ## Build
 
