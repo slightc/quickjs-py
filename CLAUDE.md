@@ -75,6 +75,9 @@ version is read from `vendor/quickjs/VERSION` and passed as `CONFIG_VERSION`.
 - Build backend: `setuptools` with a C extension declared in `setup.py`.
 - The extension compiles the vendored QuickJS sources directly (no system dep).
 - `pip install -e .` for development builds.
+- QuickJS needs a GCC/Clang toolchain (computed-goto dispatch, POSIX headers)
+  and cannot be built with MSVC. On Windows the build forces the `mingw32`
+  compiler via a custom `build_ext`; `gcc` (mingw-w64) must be on `PATH`.
 
 ## Testing
 

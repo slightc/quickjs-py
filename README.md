@@ -18,6 +18,12 @@ pip install -e .
 A C compiler and the Python development headers are required to build the
 extension.
 
+QuickJS uses GCC extensions and POSIX headers and cannot be compiled with
+MSVC. On **Windows** install [mingw-w64](https://www.mingw-w64.org/) (for
+example `choco install mingw`) and make sure `gcc` is on `PATH`; the build
+selects the mingw toolchain automatically. Linux and macOS use the system
+GCC/Clang.
+
 ## Quick start
 
 ```python
