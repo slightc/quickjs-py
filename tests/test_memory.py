@@ -31,7 +31,9 @@ def test_values_do_not_leak_js_objects(ctx):
 
 def test_value_holds_one_python_ref(ctx):
     value = ctx.eval("({})")
-    assert sys.getrefcount(value) == 2  # local + getrefcount argument
+    # CPython 3.14+ uses deferred refcounting, so getrefcount may return 1;
+    # on older CPython it returns 2 (local + getrefcount argument).
+    assert sys.getrefcount(value) in (1, 2)
 
 
 def test_context_kept_alive_by_value():
