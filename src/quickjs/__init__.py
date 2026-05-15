@@ -24,6 +24,8 @@ from ._quickjs import (
     JSError,
     QuickJSError,
     Runtime,
+    Undefined,
+    UndefinedType,
     Value,
     quickjs_version,
 )
@@ -34,6 +36,8 @@ __all__ = [
     "Value",
     "JSError",
     "QuickJSError",
+    "Undefined",
+    "UndefinedType",
     "eval",
     "quickjs_version",
     "__version__",

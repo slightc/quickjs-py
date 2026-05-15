@@ -46,3 +46,16 @@ target-version = "py38"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP"]
+
+[tool.coverage.run]
+source = ["quickjs"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.cibuildwheel]
+build = "cp39-* cp311-* cp313-*"
+skip = "*-musllinux_* *_i686"
+test-requires = "pytest"
+test-command = "pytest {project}/tests -q"

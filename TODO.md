@@ -27,15 +27,20 @@ Done — exposed through the `Runtime` / `Context` / `Value` wrappers:
 - [x] Interrupt handler: `JS_SetInterruptHandler`
 - [x] C functions: Python callables exposed to JS via `JS_NewCFunctionData`
 
-Still to expose:
-- [ ] Atoms: `JS_NewAtom`, `JS_AtomToString`, ... as a public surface
-- [ ] Classes: `JS_NewClass`, `JS_NewClassID`, opaque pointers, finalizers
-- [ ] TypedArrays / ArrayBuffer: read/write access to buffer memory
-- [ ] Modules: `JS_NewCModule`, exports, custom module loader hook
-- [ ] Bytecode: `JS_ReadObject` / `JS_WriteObject`, `JS_EvalFunction`
-- [ ] `JS_GetException` / explicit throw helpers on the public API
-- [ ] `JS_DefineProperty*` with getter/setter descriptors
-- [ ] Memory usage reporting (`JS_ComputeMemoryUsage`)
+- [x] Classes / opaque pointers / finalizers: host objects embed arbitrary
+      Python objects in JS (`Context.new_host_object`, `JS_NewClass`)
+- [x] TypedArrays / ArrayBuffer: `Value.to_bytes`, `Context.new_array_buffer`
+- [x] Modules: custom ES module loader hook (`Context.set_module_loader`)
+- [x] Bytecode: `Context.compile` / `eval_function` / `read_object`,
+      `Value.write_object` (`JS_ReadObject` / `JS_WriteObject`)
+- [x] `Context.get_exception` on the public API
+- [x] `JS_DefineProperty*` with data/getter/setter descriptors
+      (`Value.define_property`)
+- [x] Memory usage reporting (`Runtime.compute_memory_usage`)
+
+Intentionally kept internal:
+- [ ] Atoms (`JS_NewAtom`, ...) - all public APIs accept plain `str`/`int`
+      keys, so a raw atom surface with manual lifetime is not exposed.
 
 ## Phase 2 — High-level ergonomics
 - [x] `Runtime` / `Context` / `Value` object model
@@ -45,23 +50,23 @@ Still to expose:
 - [x] Python callables exposed to JS (callbacks)
 - [x] `JSError` mapping JS errors, with stack trace attribute
 - [x] Convenience top-level `eval()`
-- [ ] Distinct `Undefined` sentinel (currently both null & undefined -> None)
-- [ ] Module import support / async-await helper loop
-- [ ] Context manager (`with`) support for explicit teardown
+- [x] Distinct `Undefined` sentinel (null -> None, undefined -> Undefined)
+- [x] Module import support via the custom module loader
+- [x] Context manager (`with`) support on `Runtime` and `Context`
 
 ## Phase 3 — Packaging
 - [x] `pyproject.toml` metadata
 - [x] Type stubs (`py.typed`, `_quickjs.pyi`)
 - [x] MANIFEST so vendored sources ship in the sdist
-- [ ] `cibuildwheel` config for Linux/macOS/Windows wheels
+- [x] `cibuildwheel` config for Linux/macOS/Windows wheels
 - [ ] Publish to PyPI
 
 ## Phase 4 — Testing & CI
-- [x] pytest suite (eval, conversions, callbacks, context, runtime)
-- [ ] Memory-leak / refcount regression tests
-- [ ] GitHub Actions: build matrix, test, lint, wheel build
-- [ ] `ruff` lint + format checks in CI
-- [ ] Coverage reporting
+- [x] pytest suite (eval, conversions, callbacks, context, runtime, advanced)
+- [x] Memory-leak / refcount regression tests
+- [x] GitHub Actions: build matrix, test, lint, wheel build
+- [x] `ruff` lint + format checks in CI
+- [x] Coverage reporting
 
 ## Phase 5 — Docs & release
 - [x] README usage docs

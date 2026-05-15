@@ -29,8 +29,9 @@ typedef struct {
     PyObject_HEAD
     JSContext *ctx;
     RuntimeObject *runtime;
-    PyObject *callbacks;    /* dict: int id -> python callable */
+    PyObject *callbacks;     /* dict: int id -> python callable */
     long next_cb_id;
+    PyObject *module_loader; /* callable(name) -> source str, or NULL */
 } ContextObject;
 
 typedef struct {
@@ -42,11 +43,18 @@ typedef struct {
 static PyTypeObject Runtime_Type;
 static PyTypeObject Context_Type;
 static PyTypeObject Value_Type;
+static PyTypeObject Undefined_Type;
 
 static PyObject *make_context(RuntimeObject *runtime);
+static PyObject *make_py_host(ContextObject *context, PyObject *obj);
 
 static PyObject *QuickJSError;  /* base exception */
 static PyObject *JSError;       /* raised when JS throws */
+static PyObject *JSUndefined;   /* the singleton JS `undefined` */
+
+/* Class id for objects that opaquely embed a Python object inside JS.
+ * Shared process-wide; the class is registered into every Runtime. */
+static JSClassID py_host_class_id;
 
 /* ------------------------------------------------------------------ */
 /* Forward declarations                                                */
@@ -178,8 +186,10 @@ static PyObject *js_to_py(ContextObject *context, JSValueConst val)
     case JS_TAG_BOOL:
         return PyBool_FromLong(JS_VALUE_GET_BOOL(val));
     case JS_TAG_NULL:
-    case JS_TAG_UNDEFINED:
         Py_RETURN_NONE;
+    case JS_TAG_UNDEFINED:
+        Py_INCREF(JSUndefined);
+        return JSUndefined;
     case JS_TAG_FLOAT64:
         return PyFloat_FromDouble(JS_VALUE_GET_FLOAT64(val));
     case JS_TAG_STRING:
@@ -190,7 +200,15 @@ static PyObject *js_to_py(ContextObject *context, JSValueConst val)
     case JS_TAG_EXCEPTION:
         return raise_js_exception(context);
     default:
-        /* objects, functions, symbols: keep a wrapped reference */
+        /* A host object carries an embedded Python object: return it. */
+        if (tag == JS_TAG_OBJECT) {
+            PyObject *host = JS_GetOpaque(val, py_host_class_id);
+            if (host) {
+                Py_INCREF(host);
+                return host;
+            }
+        }
+        /* other objects, functions, symbols: keep a wrapped reference */
         return Value_wrap(context, JS_DupValue(ctx, val));
     }
 }
@@ -204,8 +222,17 @@ static PyObject *js_to_py_consume(ContextObject *context, JSValue *val)
         JS_FreeValue(ctx, *val);
         return raise_js_exception(context);
     }
-    if (tag == JS_TAG_OBJECT || tag == JS_TAG_SYMBOL ||
-        tag == JS_TAG_FUNCTION_BYTECODE || tag == JS_TAG_MODULE) {
+    if (tag == JS_TAG_OBJECT) {
+        PyObject *host = JS_GetOpaque(*val, py_host_class_id);
+        if (host) {
+            Py_INCREF(host);
+            JS_FreeValue(ctx, *val);
+            return host;
+        }
+        return Value_wrap(context, *val);
+    }
+    if (tag == JS_TAG_SYMBOL || tag == JS_TAG_FUNCTION_BYTECODE ||
+        tag == JS_TAG_MODULE) {
         return Value_wrap(context, *val);
     }
     PyObject *res = js_to_py(context, *val);
@@ -318,6 +345,10 @@ static int py_to_js(ContextObject *context, PyObject *obj, JSValue *out)
 
     if (obj == Py_None) {
         *out = JS_NULL;
+        return 0;
+    }
+    if (obj == JSUndefined) {
+        *out = JS_UNDEFINED;
         return 0;
     }
     if (PyObject_TypeCheck(obj, &Value_Type)) {
@@ -536,6 +567,90 @@ static PyObject *make_js_function(ContextObject *context, PyObject *callable,
         JS_DefinePropertyValueStr(ctx, fn, "name", nv, JS_PROP_CONFIGURABLE);
     }
     return Value_wrap(context, fn);
+}
+
+/* ------------------------------------------------------------------ */
+/* Host objects: embed an arbitrary Python object inside a JS object    */
+/* ------------------------------------------------------------------ */
+
+static void py_host_finalizer(JSRuntime *rt, JSValue val)
+{
+    PyObject *obj = JS_GetOpaque(val, py_host_class_id);
+    if (obj) {
+        /* Finalizers run while we hold the GIL (GC is driven from Python). */
+        Py_DECREF(obj);
+    }
+}
+
+static JSClassDef py_host_class_def = {
+    "PyObject",
+    .finalizer = py_host_finalizer,
+};
+
+/* Create a JS object that opaquely owns a reference to `obj`. */
+static PyObject *make_py_host(ContextObject *context, PyObject *obj)
+{
+    JSValue host = JS_NewObjectClass(context->ctx, (int)py_host_class_id);
+    if (JS_IsException(host)) {
+        return raise_js_exception(context);
+    }
+    Py_INCREF(obj);
+    JS_SetOpaque(host, obj);
+    return Value_wrap(context, host);
+}
+
+/* ------------------------------------------------------------------ */
+/* ES module loader trampoline                                          */
+/* ------------------------------------------------------------------ */
+
+static JSModuleDef *js_module_loader(JSContext *ctx, const char *module_name,
+                                     void *opaque)
+{
+    ContextObject *context = (ContextObject *)JS_GetContextOpaque(ctx);
+    if (!context || !context->module_loader) {
+        JS_ThrowReferenceError(ctx, "no module loader set for '%s'",
+                               module_name);
+        return NULL;
+    }
+    PyObject *res = PyObject_CallFunction(context->module_loader, "s",
+                                          module_name);
+    if (!res) {
+        PyObject *value = NULL, *type = NULL, *tb = NULL;
+        PyErr_Fetch(&type, &value, &tb);
+        PyObject *msg = value ? PyObject_Str(value) : NULL;
+        const char *cmsg = msg ? PyUnicode_AsUTF8(msg) : NULL;
+        JS_ThrowReferenceError(ctx, "module loader failed for '%s': %s",
+                               module_name, cmsg ? cmsg : "error");
+        Py_XDECREF(msg);
+        Py_XDECREF(type);
+        Py_XDECREF(value);
+        Py_XDECREF(tb);
+        return NULL;
+    }
+    if (res == Py_None) {
+        Py_DECREF(res);
+        JS_ThrowReferenceError(ctx, "module '%s' not found", module_name);
+        return NULL;
+    }
+    PyObject *enc = PyUnicode_Check(res)
+                        ? PyUnicode_AsEncodedString(res, "utf-8", "surrogatepass")
+                        : NULL;
+    Py_DECREF(res);
+    if (!enc) {
+        PyErr_Clear();
+        JS_ThrowTypeError(ctx, "module loader must return a string");
+        return NULL;
+    }
+    JSValue func = JS_Eval(ctx, PyBytes_AS_STRING(enc), PyBytes_GET_SIZE(enc),
+                           module_name,
+                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    Py_DECREF(enc);
+    if (JS_IsException(func)) {
+        return NULL;
+    }
+    JSModuleDef *m = JS_VALUE_GET_PTR(func);
+    JS_FreeValue(ctx, func);
+    return m;
 }
 
 /* ------------------------------------------------------------------ */
@@ -897,6 +1012,101 @@ static PyObject *Value_json(ValueObject *self, PyObject *args)
     return res;
 }
 
+/* Read an ArrayBuffer or TypedArray's bytes into a Python bytes object. */
+static PyObject *Value_to_bytes(ValueObject *self, PyObject *args)
+{
+    JSContext *ctx = VALUE_CTX(self);
+    size_t size = 0;
+    uint8_t *buf = JS_GetArrayBuffer(ctx, &size, self->val);
+    if (buf) {
+        return PyBytes_FromStringAndSize((const char *)buf, (Py_ssize_t)size);
+    }
+    /* Not an ArrayBuffer: clear the pending error and try as a TypedArray. */
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    size_t off = 0, len = 0, bpe = 0;
+    JSValue ab = JS_GetTypedArrayBuffer(ctx, self->val, &off, &len, &bpe);
+    if (JS_IsException(ab)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        PyErr_SetString(PyExc_TypeError,
+                        "value is not an ArrayBuffer or TypedArray");
+        return NULL;
+    }
+    uint8_t *tbuf = JS_GetArrayBuffer(ctx, &size, ab);
+    PyObject *res = NULL;
+    if (tbuf) {
+        res = PyBytes_FromStringAndSize((const char *)(tbuf + off),
+                                        (Py_ssize_t)len);
+    } else {
+        raise_js_exception(self->context);
+    }
+    JS_FreeValue(ctx, ab);
+    return res;
+}
+
+/* Serialise this value (typically a compiled function) to a bytecode blob. */
+static PyObject *Value_write_object(ValueObject *self, PyObject *args)
+{
+    JSContext *ctx = VALUE_CTX(self);
+    size_t size = 0;
+    uint8_t *buf = JS_WriteObject(ctx, &size, self->val, JS_WRITE_OBJ_BYTECODE);
+    if (!buf) {
+        return raise_js_exception(self->context);
+    }
+    PyObject *res = PyBytes_FromStringAndSize((const char *)buf,
+                                              (Py_ssize_t)size);
+    js_free(ctx, buf);
+    return res;
+}
+
+/* Define a property with an explicit descriptor (data or accessor). */
+static PyObject *Value_define_property(ValueObject *self, PyObject *args,
+                                       PyObject *kwds)
+{
+    static char *kwlist[] = {"key", "value", "get", "set",
+                             "writable", "enumerable", "configurable", NULL};
+    PyObject *key, *value = NULL, *getter = NULL, *setter = NULL;
+    int writable = 1, enumerable = 1, configurable = 1;
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|OOOppp:define_property",
+                                     kwlist, &key, &value, &getter, &setter,
+                                     &writable, &enumerable, &configurable)) {
+        return NULL;
+    }
+    JSContext *ctx = VALUE_CTX(self);
+    JSAtom atom = py_key_to_atom(self->context, key);
+    if (atom == JS_ATOM_NULL) {
+        return NULL;
+    }
+    int flags = (enumerable ? JS_PROP_ENUMERABLE : 0) |
+                (configurable ? JS_PROP_CONFIGURABLE : 0);
+    int r;
+    if (getter || setter) {
+        JSValue jget = JS_UNDEFINED, jset = JS_UNDEFINED;
+        if (getter && py_to_js(self->context, getter, &jget) < 0) {
+            JS_FreeAtom(ctx, atom);
+            return NULL;
+        }
+        if (setter && py_to_js(self->context, setter, &jset) < 0) {
+            JS_FreeValue(ctx, jget);
+            JS_FreeAtom(ctx, atom);
+            return NULL;
+        }
+        r = JS_DefinePropertyGetSet(ctx, self->val, atom, jget, jset, flags);
+    } else {
+        JSValue jv;
+        if (py_to_js(self->context, value ? value : Py_None, &jv) < 0) {
+            JS_FreeAtom(ctx, atom);
+            return NULL;
+        }
+        r = JS_DefinePropertyValue(ctx, self->val, atom, jv,
+                                   flags | (writable ? JS_PROP_WRITABLE : 0));
+    }
+    JS_FreeAtom(ctx, atom);
+    if (r < 0) {
+        return raise_js_exception(self->context);
+    }
+    Py_RETURN_NONE;
+}
+
 static Py_ssize_t Value_length(ValueObject *self)
 {
     JSContext *ctx = VALUE_CTX(self);
@@ -979,6 +1189,14 @@ static PyMethodDef Value_methods[] = {
     {"call_constructor", (PyCFunction)Value_call_constructor, METH_VARARGS,
      "call_constructor(*args) -> new instance"},
     {"json", (PyCFunction)Value_json, METH_NOARGS, "JSON.stringify(self)"},
+    {"to_bytes", (PyCFunction)Value_to_bytes, METH_NOARGS,
+     "Read an ArrayBuffer or TypedArray into a bytes object."},
+    {"write_object", (PyCFunction)Value_write_object, METH_NOARGS,
+     "Serialise to a QuickJS bytecode blob (bytes)."},
+    {"define_property", (PyCFunction)Value_define_property,
+     METH_VARARGS | METH_KEYWORDS,
+     "define_property(key, value=None, get=None, set=None, writable=True, "
+     "enumerable=True, configurable=True)"},
     {NULL}
 };
 
@@ -1032,6 +1250,7 @@ static PyObject *make_context(RuntimeObject *runtime)
     context->runtime = runtime;
     Py_INCREF(runtime);
     context->next_cb_id = 0;
+    context->module_loader = NULL;
     context->callbacks = PyDict_New();
     if (!context->callbacks) {
         Py_DECREF(context);
@@ -1072,6 +1291,7 @@ static void Context_dealloc(ContextObject *self)
         JS_FreeContext(self->ctx);
     }
     Py_XDECREF(self->callbacks);
+    Py_XDECREF(self->module_loader);
     Py_XDECREF(self->runtime);
     PyObject_Free(self);
 }
@@ -1207,6 +1427,132 @@ static PyObject *Context_get_runtime(ContextObject *self, void *closure)
     return (PyObject *)self->runtime;
 }
 
+/* Compile code without running it; returns a compiled-function Value. */
+static PyObject *Context_compile(ContextObject *self, PyObject *args,
+                                 PyObject *kwds)
+{
+    static char *kwlist[] = {"code", "filename", "module", NULL};
+    const char *code;
+    Py_ssize_t code_len;
+    const char *filename = "<input>";
+    int module = 0;
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "s#|sp:compile", kwlist,
+                                     &code, &code_len, &filename, &module)) {
+        return NULL;
+    }
+    int flags = JS_EVAL_FLAG_COMPILE_ONLY |
+                (module ? JS_EVAL_TYPE_MODULE : JS_EVAL_TYPE_GLOBAL);
+    JSValue res = JS_Eval(self->ctx, code, (size_t)code_len, filename, flags);
+    if (JS_IsException(res)) {
+        return raise_js_exception(self);
+    }
+    return Value_wrap(self, res);
+}
+
+/* Instantiate and run a compiled function previously produced by compile()
+ * or read_object(). */
+static PyObject *Context_eval_function(ContextObject *self, PyObject *args)
+{
+    PyObject *value;
+    if (!PyArg_ParseTuple(args, "O!:eval_function", &Value_Type, &value)) {
+        return NULL;
+    }
+    ValueObject *v = (ValueObject *)value;
+    JSValue res = JS_EvalFunction(self->ctx,
+                                  JS_DupValue(self->ctx, v->val));
+    if (JS_IsException(res)) {
+        return raise_js_exception(self);
+    }
+    return js_to_py_consume(self, &res);
+}
+
+/* Deserialise a bytecode blob written by Value.write_object(). */
+static PyObject *Context_read_object(ContextObject *self, PyObject *args)
+{
+    Py_buffer buf;
+    if (!PyArg_ParseTuple(args, "y*:read_object", &buf)) {
+        return NULL;
+    }
+    JSValue res = JS_ReadObject(self->ctx, (const uint8_t *)buf.buf,
+                                (size_t)buf.len, JS_READ_OBJ_BYTECODE);
+    PyBuffer_Release(&buf);
+    if (JS_IsException(res)) {
+        return raise_js_exception(self);
+    }
+    return Value_wrap(self, res);
+}
+
+/* Return the current pending JS exception (and clear it), or None. */
+static PyObject *Context_get_exception(ContextObject *self, PyObject *args)
+{
+    if (!JS_HasException(self->ctx)) {
+        Py_RETURN_NONE;
+    }
+    JSValue exc = JS_GetException(self->ctx);
+    return js_to_py_consume(self, &exc);
+}
+
+/* Create a JS ArrayBuffer holding a copy of the given bytes. */
+static PyObject *Context_new_array_buffer(ContextObject *self, PyObject *args)
+{
+    Py_buffer buf;
+    if (!PyArg_ParseTuple(args, "y*:new_array_buffer", &buf)) {
+        return NULL;
+    }
+    JSValue ab = JS_NewArrayBufferCopy(self->ctx, (const uint8_t *)buf.buf,
+                                       (size_t)buf.len);
+    PyBuffer_Release(&buf);
+    if (JS_IsException(ab)) {
+        return raise_js_exception(self);
+    }
+    return Value_wrap(self, ab);
+}
+
+/* Wrap an arbitrary Python object as an opaque JS host object. */
+static PyObject *Context_new_host_object(ContextObject *self, PyObject *args)
+{
+    PyObject *obj;
+    if (!PyArg_ParseTuple(args, "O:new_host_object", &obj)) {
+        return NULL;
+    }
+    return make_py_host(self, obj);
+}
+
+/* Install a callable(module_name) -> source-string ES module loader. */
+static PyObject *Context_set_module_loader(ContextObject *self, PyObject *args)
+{
+    PyObject *loader;
+    if (!PyArg_ParseTuple(args, "O:set_module_loader", &loader)) {
+        return NULL;
+    }
+    Py_XDECREF(self->module_loader);
+    if (loader == Py_None) {
+        self->module_loader = NULL;
+        JS_SetModuleLoaderFunc(self->runtime->rt, NULL, NULL, NULL);
+    } else {
+        if (!PyCallable_Check(loader)) {
+            PyErr_SetString(PyExc_TypeError, "loader must be callable or None");
+            self->module_loader = NULL;
+            return NULL;
+        }
+        Py_INCREF(loader);
+        self->module_loader = loader;
+        JS_SetModuleLoaderFunc(self->runtime->rt, NULL, js_module_loader, NULL);
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *Context_enter(ContextObject *self, PyObject *args)
+{
+    Py_INCREF(self);
+    return (PyObject *)self;
+}
+
+static PyObject *Context_exit(ContextObject *self, PyObject *args)
+{
+    Py_RETURN_FALSE;
+}
+
 static PyMethodDef Context_methods[] = {
     {"eval", (PyCFunction)Context_eval, METH_VARARGS | METH_KEYWORDS,
      "eval(code, filename='<input>', module=False, strict=False, "
@@ -1228,6 +1574,22 @@ static PyMethodDef Context_methods[] = {
      "new_function(callable, name='', length=0) -> JS function"},
     {"execute_pending_job", (PyCFunction)Context_execute_pending_job,
      METH_NOARGS, "Run one pending job; returns True if a job ran."},
+    {"compile", (PyCFunction)Context_compile, METH_VARARGS | METH_KEYWORDS,
+     "compile(code, filename='<input>', module=False) -> compiled function"},
+    {"eval_function", (PyCFunction)Context_eval_function, METH_VARARGS,
+     "eval_function(value) -> run a compiled function"},
+    {"read_object", (PyCFunction)Context_read_object, METH_VARARGS,
+     "read_object(data) -> Value deserialised from a bytecode blob"},
+    {"get_exception", (PyCFunction)Context_get_exception, METH_NOARGS,
+     "Return and clear the current pending JS exception, or None."},
+    {"new_array_buffer", (PyCFunction)Context_new_array_buffer, METH_VARARGS,
+     "new_array_buffer(data) -> JS ArrayBuffer copy of the given bytes"},
+    {"new_host_object", (PyCFunction)Context_new_host_object, METH_VARARGS,
+     "new_host_object(obj) -> opaque JS object embedding a Python object"},
+    {"set_module_loader", (PyCFunction)Context_set_module_loader, METH_VARARGS,
+     "set_module_loader(callable_or_None): resolve ES module sources."},
+    {"__enter__", (PyCFunction)Context_enter, METH_NOARGS, NULL},
+    {"__exit__", (PyCFunction)Context_exit, METH_VARARGS, NULL},
     {NULL}
 };
 
@@ -1284,6 +1646,8 @@ static PyObject *Runtime_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     }
     self->interrupt_cb = NULL;
     JS_SetRuntimeOpaque(self->rt, self);
+    /* Register the host-object class so Python objects can be embedded. */
+    JS_NewClass(self->rt, py_host_class_id, &py_host_class_def);
     return (PyObject *)self;
 }
 
@@ -1359,9 +1723,39 @@ static PyObject *Runtime_set_interrupt_handler(RuntimeObject *self, PyObject *ar
     Py_RETURN_NONE;
 }
 
+static PyObject *Runtime_compute_memory_usage(RuntimeObject *self,
+                                              PyObject *args)
+{
+    JSMemoryUsage u;
+    JS_ComputeMemoryUsage(self->rt, &u);
+#define MU(name) #name, (long long)u.name
+    return Py_BuildValue(
+        "{sLsLsLsLsLsLsLsLsLsLsLsLsL}",
+        MU(malloc_size), MU(malloc_limit), MU(memory_used_size),
+        MU(malloc_count), MU(memory_used_count), MU(atom_count),
+        MU(atom_size), MU(str_count), MU(str_size), MU(obj_count),
+        MU(obj_size), MU(prop_count), MU(prop_size));
+#undef MU
+}
+
+static PyObject *Runtime_enter(RuntimeObject *self, PyObject *args)
+{
+    Py_INCREF(self);
+    return (PyObject *)self;
+}
+
+static PyObject *Runtime_exit(RuntimeObject *self, PyObject *args)
+{
+    Py_RETURN_FALSE;
+}
+
 static PyMethodDef Runtime_methods[] = {
     {"new_context", (PyCFunction)Runtime_new_context, METH_NOARGS,
      "Create a new Context bound to this runtime."},
+    {"compute_memory_usage", (PyCFunction)Runtime_compute_memory_usage,
+     METH_NOARGS, "Return a dict of engine memory-usage counters."},
+    {"__enter__", (PyCFunction)Runtime_enter, METH_NOARGS, NULL},
+    {"__exit__", (PyCFunction)Runtime_exit, METH_VARARGS, NULL},
     {"set_memory_limit", (PyCFunction)Runtime_set_memory_limit, METH_VARARGS,
      "set_memory_limit(bytes)"},
     {"set_max_stack_size", (PyCFunction)Runtime_set_max_stack_size, METH_VARARGS,
@@ -1387,6 +1781,46 @@ static PyTypeObject Runtime_Type = {
 };
 
 /* ------------------------------------------------------------------ */
+/* Undefined singleton                                                  */
+/* ------------------------------------------------------------------ */
+
+static PyObject *Undefined_repr(PyObject *self)
+{
+    return PyUnicode_FromString("Undefined");
+}
+
+static int Undefined_bool(PyObject *self)
+{
+    return 0;
+}
+
+static PyObject *Undefined_new(PyTypeObject *type, PyObject *args,
+                               PyObject *kwds)
+{
+    if (JSUndefined) {
+        Py_INCREF(JSUndefined);
+        return JSUndefined;
+    }
+    PyErr_SetString(PyExc_TypeError, "cannot create 'UndefinedType' instances");
+    return NULL;
+}
+
+static PyNumberMethods Undefined_as_number = {
+    .nb_bool = Undefined_bool,
+};
+
+static PyTypeObject Undefined_Type = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "quickjs._quickjs.UndefinedType",
+    .tp_basicsize = sizeof(PyObject),
+    .tp_repr = Undefined_repr,
+    .tp_as_number = &Undefined_as_number,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_doc = "Type of the JS `undefined` singleton.",
+    .tp_new = Undefined_new,
+};
+
+/* ------------------------------------------------------------------ */
 /* Module                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -1401,9 +1835,20 @@ PyMODINIT_FUNC PyInit__quickjs(void)
 {
     if (PyType_Ready(&Runtime_Type) < 0 ||
         PyType_Ready(&Context_Type) < 0 ||
-        PyType_Ready(&Value_Type) < 0) {
+        PyType_Ready(&Value_Type) < 0 ||
+        PyType_Ready(&Undefined_Type) < 0) {
         return NULL;
     }
+
+    /* Reserve the process-wide class id for host objects. */
+    JS_NewClassID(&py_host_class_id);
+
+    /* Create the unique `undefined` singleton. */
+    JSUndefined = PyObject_New(PyObject, &Undefined_Type);
+    if (!JSUndefined) {
+        return NULL;
+    }
+
     PyObject *m = PyModule_Create(&quickjs_module);
     if (!m) {
         return NULL;
@@ -1421,11 +1866,15 @@ PyMODINIT_FUNC PyInit__quickjs(void)
     Py_INCREF(&Runtime_Type);
     Py_INCREF(&Context_Type);
     Py_INCREF(&Value_Type);
+    Py_INCREF(&Undefined_Type);
+    Py_INCREF(JSUndefined);
     PyModule_AddObject(m, "QuickJSError", QuickJSError);
     PyModule_AddObject(m, "JSError", JSError);
     PyModule_AddObject(m, "Runtime", (PyObject *)&Runtime_Type);
     PyModule_AddObject(m, "Context", (PyObject *)&Context_Type);
     PyModule_AddObject(m, "Value", (PyObject *)&Value_Type);
+    PyModule_AddObject(m, "UndefinedType", (PyObject *)&Undefined_Type);
+    PyModule_AddObject(m, "Undefined", JSUndefined);
 
 #ifdef CONFIG_VERSION
     PyModule_AddStringConstant(m, "quickjs_version", CONFIG_VERSION);

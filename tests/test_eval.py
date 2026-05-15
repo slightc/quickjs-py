@@ -18,7 +18,7 @@ def test_eval_boolean_and_null(ctx):
     assert ctx.eval("true") is True
     assert ctx.eval("1 < 2") is True
     assert ctx.eval("null") is None
-    assert ctx.eval("undefined") is None
+    assert ctx.eval("undefined") is quickjs.Undefined
 
 
 def test_eval_persists_state(ctx):

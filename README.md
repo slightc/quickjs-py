@@ -78,6 +78,44 @@ JS objects, arrays and functions returned to Python are wrapped as
 `quickjs.Value`. Call `.to_python()` to recursively convert arrays/objects
 into native `list`/`dict` structures.
 
+JS `null` becomes Python `None`; JS `undefined` becomes the distinct
+`quickjs.Undefined` singleton.
+
+## More features
+
+```python
+import quickjs
+
+ctx = quickjs.Context()
+
+# Compile once, run many times (and serialise to bytecode)
+compiled = ctx.compile("Math.PI * r * r")
+blob = compiled.write_object()
+restored = ctx.read_object(blob)
+
+# ArrayBuffer / TypedArray access
+buf = ctx.new_array_buffer(b"\x01\x02\x03")
+ctx.eval("new Uint8Array([4, 5, 6])").to_bytes()      # b'\x04\x05\x06'
+
+# Embed an arbitrary Python object opaquely inside JS
+handle = ctx.new_host_object(open("data.txt"))         # round-trips unchanged
+
+# Accessor properties backed by Python callables
+obj = ctx.new_object()
+obj.define_property("now", get=lambda: __import__("time").time())
+
+# Custom ES module loader
+ctx.set_module_loader(lambda name: MODULES.get(name))
+ctx.eval("import { x } from 'mod';", module=True)
+
+# Engine memory counters
+ctx.runtime.compute_memory_usage()                     # -> dict
+
+# Context manager
+with quickjs.Context() as c:
+    c.eval("1 + 1")
+```
+
 ## Testing
 
 ```sh
