@@ -3,12 +3,15 @@
 Python bindings for [QuickJS](https://github.com/bellard/quickjs), Fabrice
 Bellard's small and embeddable JavaScript engine.
 
-The QuickJS engine is vendored and compiled directly into the extension, so
-there is no external dependency on a system QuickJS install.
+The QuickJS engine is included as a git submodule and compiled directly into
+the extension, so there is no external dependency on a system QuickJS install.
 
 ## Installation
 
+The engine lives in a git submodule, so initialise it first:
+
 ```sh
+git submodule update --init
 pip install -e .
 ```
 

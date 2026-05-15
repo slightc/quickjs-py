@@ -30,7 +30,7 @@ quickjs-py/
 ├── pyproject.toml       # build config (setuptools + build-backend)
 ├── setup.py             # C extension build definition
 ├── vendor/
-│   └── quickjs/         # vendored QuickJS source (quickjs-ng), git submodule
+│   └── quickjs/         # QuickJS source (Bellard upstream), git submodule
 ├── src/
 │   └── quickjs/
 │       ├── __init__.py  # public package API
@@ -64,8 +64,9 @@ derived from it, so teardown order is always correct.
 ## Engine choice
 
 Use **Bellard's upstream QuickJS** (https://github.com/bellard/quickjs). The
-engine sources are vendored directly under `vendor/quickjs` (not a submodule)
-so that the sdist is fully self-contained. Compiled translation units:
+engine is included as a git submodule under `vendor/quickjs`, pinned to a
+known-good commit. After cloning the repository, run
+`git submodule update --init` before building. Compiled translation units:
 `quickjs.c`, `libregexp.c`, `libunicode.c`, `cutils.c`, `dtoa.c`. The engine
 version is read from `vendor/quickjs/VERSION` and passed as `CONFIG_VERSION`.
 

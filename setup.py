@@ -1,9 +1,11 @@
 """Build configuration for the quickjs-py C extension.
 
 The QuickJS engine (Bellard's reference implementation,
-https://github.com/bellard/quickjs) is vendored under ``vendor/quickjs``
-and compiled directly into the extension module, so there is no external
-dependency on a system QuickJS install.
+https://github.com/bellard/quickjs) lives in the ``vendor/quickjs`` git
+submodule and is compiled directly into the extension module, so there is
+no external dependency on a system QuickJS install.
+
+Run ``git submodule update --init`` before building from a git checkout.
 """
 
 import os
@@ -12,6 +14,12 @@ import sys
 from setuptools import Extension, setup
 
 VENDOR = "vendor/quickjs"
+
+if not os.path.exists(os.path.join(VENDOR, "quickjs.c")):
+    raise SystemExit(
+        "QuickJS sources not found under vendor/quickjs.\n"
+        "Initialise the submodule first: git submodule update --init"
+    )
 
 quickjs_sources = [
     f"{VENDOR}/quickjs.c",

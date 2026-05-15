@@ -7,7 +7,7 @@ Task tracker for quickjs-py. Check items off as completed.
 - [x] Add `pyproject.toml` (build-system, project metadata, deps, tool config)
 - [x] Add `setup.py` with C extension definition
 - [x] Create `src/quickjs/` package skeleton with `__init__.py`
-- [x] Vendor QuickJS (Bellard upstream) source directly under `vendor/quickjs`
+- [x] Add QuickJS (Bellard upstream) as a git submodule under `vendor/quickjs`
 - [x] Verify the extension builds and imports
 
 ## Phase 1 — QuickJS API coverage (`_quickjs.c`)
