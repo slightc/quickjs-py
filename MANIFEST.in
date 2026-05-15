@@ -1,9 +1,14 @@
 include LICENSE
 include README.md
+include CHANGELOG.md
 include CLAUDE.md
 include TODO.md
 include setup.py
 include pyproject.toml
+
+# Documentation and runnable examples.
+recursive-include docs *.md
+recursive-include examples *.py *.md
 
 # Vendored QuickJS engine sources, required to build the C extension.
 recursive-include vendor/quickjs *.c *.h

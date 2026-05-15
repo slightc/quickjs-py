@@ -66,6 +66,12 @@ except quickjs.JSError as exc:
 
 See `CLAUDE.md` for the full design and `TODO.md` for the roadmap.
 
+## Documentation
+
+* `docs/api.md` - full API reference for `Runtime`, `Context` and `Value`.
+* `examples/` - runnable example scripts; see `examples/README.md`.
+* `CHANGELOG.md` - release history.
+
 ## Type conversion
 
 | Python              | JavaScript            |
