@@ -18,3 +18,4 @@ python examples/01_basic_eval.py
 | `07_limits.py` | Memory limits and interrupt handlers. |
 | `08_promises.py` | Promise/job queue, `async_eval` and the `await_promise` asyncio bridge. |
 | `09_benchmark_bytecode_vs_eval.py` | Benchmark: `read_object` rebuild vs. direct `eval`. |
+| `10_js_classes.py` | Defining, instantiating and subclassing JS `class`es. |
