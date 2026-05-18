@@ -8,7 +8,16 @@ the extension, so there is no external dependency on a system QuickJS install.
 
 ## Installation
 
-The engine lives in a git submodule, so initialise it first:
+Install the latest release from PyPI:
+
+```sh
+pip install quickjs-py
+```
+
+### From source
+
+To build from a checkout, the engine lives in a git submodule, so initialise
+it first:
 
 ```sh
 git submodule update --init
