@@ -14,29 +14,27 @@ import time
 
 import quickjs
 
+
+def _objects_snippet(count):
+    """Build an IIFE declaring `count` object literals; cheap to run, costly
+    to parse."""
+    pad = "v" * 20
+    body = "\n".join(
+        f"  const o{i} = {{ a: {i}, b: '{pad}', fn: function (x) {{ return x + {i}; }} }};"
+        for i in range(count)
+    )
+    return f"(function () {{\n{body}\n  return o0.fn(o{count - 1}.a);\n}})()"
+
+
 # Snippets of increasing parse cost. The runtime work is deliberately small so
 # the measurement is dominated by parse/compile, which is what bytecode skips.
 SNIPPETS = {
     "tiny": "1 + 1",
     "small": "(function () { let s = 0; for (let i = 0; i < 10; i++) s += i; return s; })()",
-    "medium": "\n".join(
-        f"function f{i}(x) {{ return x * {i} + {i}; }}" for i in range(40)
-    )
+    "medium": "\n".join(f"function f{i}(x) {{ return x * {i} + {i}; }}" for i in range(40))
     + "\nf0(1) + f39(2);",
-    "large": "(function () {\n"
-    + "\n".join(
-        "  const o%d = { a: %d, b: '%s', fn: function (x) { return x + %d; } };"
-        % (i, i, "v" * 20, i)
-        for i in range(150)
-    )
-    + "\n  return o0.fn(o149.a);\n})()",
-    "xl": "(function () {\n"
-    + "\n".join(
-        "  const o%d = { a: %d, b: '%s', fn: function (x) { return x + %d; } };"
-        % (i, i, "v" * 20, i)
-        for i in range(1100)
-    )
-    + "\n  return o0.fn(o1099.a);\n})()",
+    "large": _objects_snippet(150),
+    "xl": _objects_snippet(1100),
 }
 
 # Iterations per case: heavier snippets run fewer times so the whole
@@ -95,8 +93,7 @@ def main():
     for name, eval_us, bc_us, blob_len in details:
         speedup = eval_us / bc_us if bc_us else float("inf")
         print(
-            f"{name:<10} {eval_us * 1e6:9.2f}us {bc_us * 1e6:9.2f}us "
-            f"{speedup:9.2f}x {blob_len:7d}B"
+            f"{name:<10} {eval_us * 1e6:9.2f}us {bc_us * 1e6:9.2f}us {speedup:9.2f}x {blob_len:7d}B"
         )
 
     print(
