@@ -11,7 +11,7 @@ the extension, so there is no external dependency on a system QuickJS install.
 Install the latest release from PyPI:
 
 ```sh
-pip install quickjs-py
+pip install quickjs-bindings
 ```
 
 ### From source
