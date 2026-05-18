@@ -53,6 +53,9 @@ Intentionally kept internal:
 - [x] Distinct `Undefined` sentinel (null -> None, undefined -> Undefined)
 - [x] Module import support via the custom module loader
 - [x] Context manager (`with`) support on `Runtime` and `Context`
+- [x] Async execution: `Context.async_eval` / top-level `async_eval`,
+      `Context.await_promise` (asyncio bridge), `Value.is_promise` /
+      `promise_state` / `result()`
 
 ## Phase 3 — Packaging
 - [x] `pyproject.toml` metadata

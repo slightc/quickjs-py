@@ -120,6 +120,14 @@ obj.define_property("now", get=lambda: __import__("time").time())
 ctx.set_module_loader(lambda name: MODULES.get(name))
 ctx.eval("import { x } from 'mod';", module=True)
 
+# Run async JS: async_eval pumps the job queue until the result settles
+ctx.eval("async function add(a, b) { return await Promise.resolve(a + b); }")
+ctx.async_eval("add(2, 3)")                            # -> 5
+
+# await_promise bridges QuickJS promises into asyncio
+async def main():
+    return await ctx.await_promise(ctx.eval("add(40, 2)"))   # -> 42
+
 # Engine memory counters
 ctx.runtime.compute_memory_usage()                     # -> dict
 

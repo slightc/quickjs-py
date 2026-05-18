@@ -32,6 +32,17 @@ quickjs.eval("1 + 2")            # -> 3
 quickjs.eval("export const x = 1", module=True)
 ```
 
+### `quickjs.async_eval(code, **kwargs)`
+
+Like `quickjs.eval`, but evaluates `code` that may use top-level `await`,
+pumping the job queue until the result settles. Extra keyword arguments are
+forwarded to `Context.async_eval`.
+
+```python
+import quickjs
+quickjs.async_eval("await Promise.resolve(42)")   # -> 42
+```
+
 ## Type conversion
 
 Values cross the Python/JS boundary automatically.
@@ -125,6 +136,41 @@ wrapped in a `Value`. With `module=True` the code is parsed as an ES module
 (strict mode, supports `import`/`export`). With `compile_only=True` the code is
 compiled but not run, returning a compiled `Value` (see `eval_function`).
 
+### `Context.async_eval(code, filename="<async>", module=False, strict=False)`
+
+Evaluate `code` that may use top-level `await`, then pump the job queue until
+the resulting promise settles and return its value. A rejected promise is
+raised as a `JSError`. If the queue drains while the promise is still pending
+(for example `await new Promise(() => {})`), a `QuickJSError` is raised.
+
+Calling an async function whose result is itself a promise is unwrapped
+recursively, so `async_eval("f()")` behaves like `async_eval("await f()")`.
+
+```python
+ctx.eval("async function f() { return await Promise.resolve(20) + 1; }")
+ctx.async_eval("f()")            # -> 21
+ctx.async_eval("1 + 2")          # -> 3 (synchronous code works too)
+```
+
+### `Context.await_promise(value)`
+
+Asyncio-compatible bridge. Returns a coroutine that drives the job queue and
+resolves to the promise's settled value; `await` it from inside an `async`
+function. Jobs are pumped one at a time, yielding to the event loop between
+each so other `asyncio` tasks keep running. A rejected promise raises
+`JSError`; a promise that can never settle raises `QuickJSError`. Values that
+are not promises are returned unchanged.
+
+```python
+import asyncio
+
+async def main():
+    ctx.eval("async function f() { return await Promise.resolve(10) + 5; }")
+    result = await ctx.await_promise(ctx.eval("f()"))   # -> 15
+
+asyncio.run(main())
+```
+
 ### `Context.get_global()`
 
 Return the global object as a `Value`.
@@ -215,6 +261,8 @@ callers never call `JS_FreeValue`. A `Value` keeps its `Context` (and thus
 | `is_symbol` | bool | Whether the value is a symbol. |
 | `is_error` | bool | Whether the value is an `Error`. |
 | `is_constructor` | bool | Whether the value can be used with `new`. |
+| `is_promise` | bool | Whether the value is a `Promise`. |
+| `promise_state` | str \| None | `"pending"`, `"fulfilled"` or `"rejected"` for a `Promise`, otherwise `None`. |
 
 ### `Value.to_python(deep=True)`
 
@@ -256,6 +304,13 @@ Return the raw bytes backing an `ArrayBuffer` or TypedArray.
 ### `Value.write_object()`
 
 Serialise a compiled value to bytecode `bytes` (see `Context.read_object`).
+
+### `Value.result()`
+
+For a `Promise` value, pump the job queue until it settles and return its
+fulfilled value, or raise `JSError` if it rejected. Raises `TypeError` if the
+value is not a promise, or `QuickJSError` if it stays pending after the queue
+drains. See also `Context.await_promise` for an asyncio-friendly equivalent.
 
 ### `Value.define_property(key, value=..., get=None, set=None, writable=False, enumerable=False, configurable=False)`
 

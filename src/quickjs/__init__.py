@@ -39,6 +39,7 @@ __all__ = [
     "Undefined",
     "UndefinedType",
     "eval",
+    "async_eval",
     "quickjs_version",
     "__version__",
 ]
@@ -54,3 +55,14 @@ def eval(code: str, **kwargs: object) -> object:
     :meth:`Context.eval`.
     """
     return Context().eval(code, **kwargs)
+
+
+def async_eval(code: str, **kwargs: object) -> object:
+    """Evaluate JavaScript that may use top-level ``await`` in a throwaway
+    context, pumping the job queue until the result settles.
+
+    Convenience wrapper around :meth:`Context.async_eval`; for repeated
+    evaluation create a :class:`Context` and reuse it. Extra keyword arguments
+    are forwarded to :meth:`Context.async_eval`.
+    """
+    return Context().async_eval(code, **kwargs)

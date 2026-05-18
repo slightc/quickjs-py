@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `Context.async_eval(code, ...)` and the top-level `quickjs.async_eval()`
+  helper: evaluate code that may use top-level `await`, pumping the job queue
+  until the result settles. Rejections raise `JSError`; a promise that can
+  never settle raises `QuickJSError`.
+- `Context.await_promise(value)`: an asyncio-compatible coroutine that drives
+  the job queue cooperatively, yielding to the event loop between jobs, so a
+  QuickJS promise can be `await`ed from inside an `asyncio` coroutine.
+- `Value.is_promise` and `Value.promise_state` for inspecting promises, and
+  `Value.result()` to settle a promise synchronously.
+
 ## [0.1.0] - 2026-05-15
 
 Initial release. Python bindings for Fabrice Bellard's QuickJS engine,
