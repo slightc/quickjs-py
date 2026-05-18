@@ -16,5 +16,5 @@ python examples/01_basic_eval.py
 | `05_modules.py` | A custom ES module loader. |
 | `06_bytecode.py` | Compiling once and serialising to bytecode. |
 | `07_limits.py` | Memory limits and interrupt handlers. |
-| `08_promises.py` | Driving the promise/job queue. |
+| `08_promises.py` | Promise/job queue, `async_eval` and the `await_promise` asyncio bridge. |
 | `09_benchmark_bytecode_vs_eval.py` | Benchmark: `read_object` rebuild vs. direct `eval`. |

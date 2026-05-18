@@ -71,10 +71,10 @@ static PyObject *make_js_function(ContextObject *context, PyObject *callable,
 /* ------------------------------------------------------------------ */
 
 /* Pull the pending JS exception, raise it as a Python JSError, return NULL. */
-static PyObject *raise_js_exception(ContextObject *context)
+/* Raise a Python JSError from the JS value `exc`, which is consumed. */
+static PyObject *raise_js_from_value(ContextObject *context, JSValue exc)
 {
     JSContext *ctx = context->ctx;
-    JSValue exc = JS_GetException(ctx);
     PyObject *message = NULL;
     PyObject *stack = NULL;
 
@@ -116,6 +116,12 @@ static PyObject *raise_js_exception(ContextObject *context)
     Py_XDECREF(message);
     Py_XDECREF(stack);
     return NULL;
+}
+
+/* Raise a Python JSError from the context's pending exception. */
+static PyObject *raise_js_exception(ContextObject *context)
+{
+    return raise_js_from_value(context, JS_GetException(context->ctx));
 }
 
 /* ------------------------------------------------------------------ */
@@ -238,6 +244,53 @@ static PyObject *js_to_py_consume(ContextObject *context, JSValue *val)
     PyObject *res = js_to_py(context, *val);
     JS_FreeValue(ctx, *val);
     return res;
+}
+
+/* Pump the job queue until `promise` settles. On fulfilment, store the
+ * fulfilled JS value in *out (the caller takes ownership) and return 0. On
+ * rejection raise JSError and return -1. Also returns -1 (with a Python
+ * exception set) if `promise` is not a Promise, or if it stays pending after
+ * the queue drains. `promise` is borrowed (the caller still owns it). */
+static int settle_promise_value(ContextObject *context, JSValueConst promise,
+                                JSValue *out)
+{
+    JSContext *ctx = context->ctx;
+    JSRuntime *rt = context->runtime->rt;
+    if (JS_PromiseState(ctx, promise) == (JSPromiseStateEnum)-1) {
+        PyErr_SetString(PyExc_TypeError, "value is not a Promise");
+        return -1;
+    }
+    while (JS_PromiseState(ctx, promise) == JS_PROMISE_PENDING) {
+        JSContext *jctx;
+        int r = JS_ExecutePendingJob(rt, &jctx);
+        if (r < 0) {
+            raise_js_exception(context);
+            return -1;
+        }
+        if (r == 0) {
+            PyErr_SetString(QuickJSError,
+                            "promise is still pending and the job queue "
+                            "is empty");
+            return -1;
+        }
+    }
+    JSValue result = JS_PromiseResult(ctx, promise);
+    if (JS_PromiseState(ctx, promise) == JS_PROMISE_REJECTED) {
+        raise_js_from_value(context, result);
+        return -1;
+    }
+    *out = result;
+    return 0;
+}
+
+/* As above, but return the fulfilled value as a Python object. */
+static PyObject *settle_promise(ContextObject *context, JSValueConst promise)
+{
+    JSValue result;
+    if (settle_promise_value(context, promise, &result) < 0) {
+        return NULL;
+    }
+    return js_to_py_consume(context, &result);
 }
 
 /* Recursively convert a JS value: arrays -> list, plain objects -> dict.
@@ -715,6 +768,27 @@ VALUE_PRED(is_undefined, JS_IsUndefined(self->val))
 VALUE_PRED(is_symbol, JS_IsSymbol(self->val))
 VALUE_PRED(is_error, JS_IsError(ctx, self->val))
 VALUE_PRED(is_constructor, JS_IsConstructor(ctx, self->val))
+VALUE_PRED(is_promise,
+           JS_PromiseState(ctx, self->val) != (JSPromiseStateEnum)-1)
+
+static PyObject *Value_promise_state(ValueObject *self, void *closure)
+{
+    switch (JS_PromiseState(VALUE_CTX(self), self->val)) {
+    case JS_PROMISE_PENDING:
+        return PyUnicode_FromString("pending");
+    case JS_PROMISE_FULFILLED:
+        return PyUnicode_FromString("fulfilled");
+    case JS_PROMISE_REJECTED:
+        return PyUnicode_FromString("rejected");
+    default:
+        Py_RETURN_NONE;
+    }
+}
+
+static PyObject *Value_result(ValueObject *self, PyObject *args)
+{
+    return settle_promise(self->context, self->val);
+}
 
 static PyObject *Value_to_python(ValueObject *self, PyObject *args,
                                  PyObject *kwds)
@@ -1172,6 +1246,10 @@ static PyGetSetDef Value_getset[] = {
     {"is_symbol", (getter)Value_is_symbol, NULL, NULL, NULL},
     {"is_error", (getter)Value_is_error, NULL, NULL, NULL},
     {"is_constructor", (getter)Value_is_constructor, NULL, NULL, NULL},
+    {"is_promise", (getter)Value_is_promise, NULL,
+     "True if the value is a Promise.", NULL},
+    {"promise_state", (getter)Value_promise_state, NULL,
+     "'pending'/'fulfilled'/'rejected' for a Promise, else None.", NULL},
     {NULL}
 };
 
@@ -1193,6 +1271,9 @@ static PyMethodDef Value_methods[] = {
      "Read an ArrayBuffer or TypedArray into a bytes object."},
     {"write_object", (PyCFunction)Value_write_object, METH_NOARGS,
      "Serialise to a QuickJS bytecode blob (bytes)."},
+    {"result", (PyCFunction)Value_result, METH_NOARGS,
+     "Pump the job queue until this Promise settles, then return its "
+     "fulfilled value (or raise JSError if it rejected)."},
     {"define_property", (PyCFunction)Value_define_property,
      METH_VARARGS | METH_KEYWORDS,
      "define_property(key, value=None, get=None, set=None, writable=True, "
@@ -1321,6 +1402,92 @@ static PyObject *Context_eval(ContextObject *self, PyObject *args, PyObject *kwd
         return raise_js_exception(self);
     }
     return js_to_py_consume(self, &res);
+}
+
+static PyObject *Context_async_eval(ContextObject *self, PyObject *args,
+                                    PyObject *kwds)
+{
+    static char *kwlist[] = {"code", "filename", "module", "strict", NULL};
+    const char *code;
+    Py_ssize_t code_len;
+    const char *filename = "<async>";
+    int module = 0, strict = 0;
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "s#|spp:async_eval", kwlist,
+                                     &code, &code_len, &filename,
+                                     &module, &strict)) {
+        return NULL;
+    }
+    int flags = module ? JS_EVAL_TYPE_MODULE : JS_EVAL_TYPE_GLOBAL;
+    if (strict) {
+        flags |= JS_EVAL_FLAG_STRICT;
+    }
+    /* JS_EVAL_FLAG_ASYNC wraps the script so it always returns a Promise and
+     * top-level `await` works; it is only valid for global (non-module) code,
+     * while modules support top-level await natively. */
+    if (!module) {
+        flags |= JS_EVAL_FLAG_ASYNC;
+    }
+    JSValue res = JS_Eval(self->ctx, code, (size_t)code_len, filename, flags);
+    if (JS_IsException(res)) {
+        return raise_js_exception(self);
+    }
+    if (!module) {
+        /* The async-wrapped script resolves to a `{ value: <result> }`
+         * object; settle it and unwrap the completion value. */
+        JSValue settled;
+        if (settle_promise_value(self, res, &settled) < 0) {
+            JS_FreeValue(self->ctx, res);
+            return NULL;
+        }
+        JS_FreeValue(self->ctx, res);
+        JSValue inner = JS_GetPropertyStr(self->ctx, settled, "value");
+        JS_FreeValue(self->ctx, settled);
+        if (JS_IsException(inner)) {
+            return raise_js_exception(self);
+        }
+        /* If the completion value is itself a Promise, settle it too, so
+         * async_eval("f()") behaves like async_eval("await f()"). */
+        while (JS_PromiseState(self->ctx, inner) != (JSPromiseStateEnum)-1) {
+            JSValue next;
+            if (settle_promise_value(self, inner, &next) < 0) {
+                JS_FreeValue(self->ctx, inner);
+                return NULL;
+            }
+            JS_FreeValue(self->ctx, inner);
+            inner = next;
+        }
+        return js_to_py_consume(self, &inner);
+    }
+    /* Module evaluation may yield a Promise (top-level await) or a value. */
+    if (JS_PromiseState(self->ctx, res) != (JSPromiseStateEnum)-1) {
+        PyObject *out = settle_promise(self, res);
+        JS_FreeValue(self->ctx, res);
+        return out;
+    }
+    return js_to_py_consume(self, &res);
+}
+
+/* asyncio bridge: delegate to the pure-Python helper so the raw layer stays
+ * dumb. Returns a coroutine; `await` it inside an asyncio coroutine. */
+static PyObject *Context_await_promise(ContextObject *self, PyObject *args)
+{
+    PyObject *value;
+    if (!PyArg_ParseTuple(args, "O:await_promise", &value)) {
+        return NULL;
+    }
+    PyObject *mod = PyImport_ImportModule("quickjs._async");
+    if (!mod) {
+        return NULL;
+    }
+    PyObject *fn = PyObject_GetAttrString(mod, "await_promise");
+    Py_DECREF(mod);
+    if (!fn) {
+        return NULL;
+    }
+    PyObject *res =
+        PyObject_CallFunctionObjArgs(fn, (PyObject *)self, value, NULL);
+    Py_DECREF(fn);
+    return res;
 }
 
 static PyObject *Context_get_global(ContextObject *self, PyObject *args)
@@ -1572,6 +1739,15 @@ static PyMethodDef Context_methods[] = {
     {"new_function", (PyCFunction)Context_new_function,
      METH_VARARGS | METH_KEYWORDS,
      "new_function(callable, name='', length=0) -> JS function"},
+    {"async_eval", (PyCFunction)Context_async_eval,
+     METH_VARARGS | METH_KEYWORDS,
+     "async_eval(code, filename='<async>', module=False, strict=False) -> "
+     "result. Evaluates code that may use top-level `await`, pumps the job "
+     "queue until the resulting promise settles, and returns its value "
+     "(or raises JSError if it rejected)."},
+    {"await_promise", (PyCFunction)Context_await_promise, METH_VARARGS,
+     "await_promise(value) -> coroutine. Asyncio-compatible: `await` it to "
+     "drive the job queue and obtain the Promise's settled value."},
     {"execute_pending_job", (PyCFunction)Context_execute_pending_job,
      METH_NOARGS, "Run one pending job; returns True if a job ran."},
     {"compile", (PyCFunction)Context_compile, METH_VARARGS | METH_KEYWORDS,
