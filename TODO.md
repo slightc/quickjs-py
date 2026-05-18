@@ -39,7 +39,7 @@ Done — exposed through the `Runtime` / `Context` / `Value` wrappers:
 - [x] Memory usage reporting (`Runtime.compute_memory_usage`)
 
 Intentionally kept internal:
-- [ ] Atoms (`JS_NewAtom`, ...) - all public APIs accept plain `str`/`int`
+- [x] ~~Atoms (`JS_NewAtom`, ...)~~ - all public APIs accept plain `str`/`int`
       keys, so a raw atom surface with manual lifetime is not exposed.
 
 ## Phase 2 — High-level ergonomics
@@ -70,7 +70,7 @@ Intentionally kept internal:
 
 ## Phase 5 — Docs & release
 - [x] README usage docs
-- [ ] API reference docs
-- [ ] Examples directory
-- [ ] CHANGELOG
+- [x] API reference docs
+- [x] Examples directory
+- [x] CHANGELOG
 - [ ] Tag and publish first release to PyPI
