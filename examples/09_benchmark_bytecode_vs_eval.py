@@ -30,9 +30,24 @@ SNIPPETS = {
         for i in range(150)
     )
     + "\n  return o0.fn(o149.a);\n})()",
+    "xl": "(function () {\n"
+    + "\n".join(
+        "  const o%d = { a: %d, b: '%s', fn: function (x) { return x + %d; } };"
+        % (i, i, "v" * 20, i)
+        for i in range(1100)
+    )
+    + "\n  return o0.fn(o1099.a);\n})()",
 }
 
-ITERATIONS = 20_000
+# Iterations per case: heavier snippets run fewer times so the whole
+# benchmark stays a few seconds rather than minutes.
+ITERATIONS = {
+    "tiny": 20_000,
+    "small": 20_000,
+    "medium": 5_000,
+    "large": 1_000,
+    "xl": 100,
+}
 
 
 def bench(label, fn, iterations):
@@ -47,8 +62,7 @@ def bench(label, fn, iterations):
 
 
 def main():
-    print(f"quickjs version: {quickjs.quickjs_version}")
-    print(f"iterations per case: {ITERATIONS}\n")
+    print(f"quickjs version: {quickjs.quickjs_version}\n")
 
     header = f"{'case':<10} {'eval':>12} {'bytecode':>12} {'speedup':>10} {'blob':>8}"
     print(header)
@@ -70,17 +84,18 @@ def main():
         # Sanity check: both paths must produce the same result.
         assert run_eval() == run_bytecode(), f"result mismatch for {name!r}"
 
-        print(f"\n[{name}]  source = {len(code)} bytes")
-        eval_t = bench("direct eval", run_eval, ITERATIONS)
-        bc_t = bench("read_object + eval_fn", run_bytecode, ITERATIONS)
-        details.append((name, eval_t, bc_t, len(blob)))
+        iterations = ITERATIONS[name]
+        print(f"\n[{name}]  source = {len(code)} bytes, {iterations} iterations")
+        eval_t = bench("direct eval", run_eval, iterations)
+        bc_t = bench("read_object + eval_fn", run_bytecode, iterations)
+        details.append((name, eval_t / iterations, bc_t / iterations, len(blob)))
 
     print("\n" + header)
     print("-" * len(header))
-    for name, eval_t, bc_t, blob_len in details:
-        speedup = eval_t / bc_t if bc_t else float("inf")
+    for name, eval_us, bc_us, blob_len in details:
+        speedup = eval_us / bc_us if bc_us else float("inf")
         print(
-            f"{name:<10} {eval_t:11.4f}s {bc_t:11.4f}s "
+            f"{name:<10} {eval_us * 1e6:9.2f}us {bc_us * 1e6:9.2f}us "
             f"{speedup:9.2f}x {blob_len:7d}B"
         )
 
