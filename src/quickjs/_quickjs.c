@@ -23,15 +23,25 @@ typedef struct {
     PyObject_HEAD
     JSRuntime *rt;
     PyObject *interrupt_cb; /* callable or NULL */
+    /* Common atoms cached for the lifetime of the runtime to avoid the
+     * per-call JS_NewAtom("length") / JS_FreeAtom roundtrip in hot paths.
+     * Initialised lazily on first Context creation; JS_ATOM_NULL until
+     * then. Freed via JS_FreeAtomRT in Runtime_dealloc. */
+    JSAtom atom_length;
+    JSAtom atom_name;
+    JSAtom atom_stack;
+    JSAtom atom_value;
+    JSAtom atom_BigInt;
 } RuntimeObject;
 
 typedef struct {
     PyObject_HEAD
     JSContext *ctx;
     RuntimeObject *runtime;
-    PyObject *callbacks;     /* dict: int id -> python callable */
-    long next_cb_id;
     PyObject *module_loader; /* callable(name) -> source str, or NULL */
+    /* Cached global object: JS_GetGlobalObject otherwise dups + frees on
+     * every ctx.get/ctx.set. JS_UNDEFINED until first use. */
+    JSValue global;
 } ContextObject;
 
 typedef struct {
@@ -65,6 +75,7 @@ static int py_to_js(ContextObject *context, PyObject *obj, JSValue *out);
 static PyObject *Value_wrap(ContextObject *context, JSValue val);
 static PyObject *make_js_function(ContextObject *context, PyObject *callable,
                                   const char *name, int length);
+static JSValueConst context_global(ContextObject *self);
 
 /* ------------------------------------------------------------------ */
 /* Error helpers                                                        */
@@ -84,7 +95,7 @@ static PyObject *raise_js_from_value(ContextObject *context, JSValue exc)
         JS_FreeCString(ctx, msg);
     }
     if (JS_IsError(ctx, exc)) {
-        JSValue st = JS_GetPropertyStr(ctx, exc, "stack");
+        JSValue st = JS_GetProperty(ctx, exc, context->runtime->atom_stack);
         if (!JS_IsUndefined(st) && !JS_IsException(st)) {
             const char *s = JS_ToCString(ctx, st);
             if (s) {
@@ -323,7 +334,7 @@ static PyObject *js_to_py_deep(ContextObject *context, JSValueConst val,
 
     PyObject *result = NULL;
     if (JS_IsArray(ctx, val)) {
-        JSValue lenv = JS_GetPropertyStr(ctx, val, "length");
+        JSValue lenv = JS_GetProperty(ctx, val, context->runtime->atom_length);
         int64_t n = 0;
         JS_ToInt64(ctx, &n, lenv);
         JS_FreeValue(ctx, lenv);
@@ -437,9 +448,9 @@ static int py_to_js(ContextObject *context, PyObject *obj, JSValue *out)
         const char *cs = PyUnicode_AsUTF8(s);
         JSValue jss = JS_NewString(ctx, cs);
         Py_DECREF(s);
-        JSValue global = JS_GetGlobalObject(ctx);
-        JSValue bigint = JS_GetPropertyStr(ctx, global, "BigInt");
-        JS_FreeValue(ctx, global);
+        JSValueConst global = context_global(context);
+        JSValue bigint = JS_GetProperty(ctx, global,
+                                        context->runtime->atom_BigInt);
         JSValue res = JS_Call(ctx, bigint, JS_UNDEFINED, 1, &jss);
         JS_FreeValue(ctx, bigint);
         JS_FreeValue(ctx, jss);
@@ -535,20 +546,21 @@ static int py_to_js(ContextObject *context, PyObject *obj, JSValue *out)
 /* Python callable -> JS function (trampoline)                          */
 /* ------------------------------------------------------------------ */
 
+/* The Python callable is embedded in func_data[0] as a py-host JS object,
+ * so trampoline dispatch is a single JS_GetOpaque (O(1), no Python dict),
+ * and the callable's lifetime is tied to the JS function's: when the
+ * function is GC'd, func_data is freed, the holder's refcount drops to
+ * zero, and py_host_finalizer Py_DECREFs the callable. Fixes both the
+ * per-call dict lookup and the unbounded growth of the old callbacks
+ * registry. */
 static JSValue js_trampoline(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv,
                              int magic, JSValue *func_data)
 {
     ContextObject *context = (ContextObject *)JS_GetContextOpaque(ctx);
-    int32_t id = 0;
-    JS_ToInt32(ctx, &id, func_data[0]);
-
-    PyObject *key = PyLong_FromLong(id);
-    PyObject *callable = key ? PyDict_GetItemWithError(context->callbacks, key)
-                             : NULL;
-    Py_XDECREF(key);
+    PyObject *callable = JS_GetOpaque(func_data[0], py_host_class_id);
     if (!callable) {
-        return JS_ThrowInternalError(ctx, "quickjs-py: callback %d not found", id);
+        return JS_ThrowInternalError(ctx, "quickjs-py: callback holder lost");
     }
 
     PyObject *args = PyTuple_New(argc);
@@ -597,19 +609,16 @@ static JSValue js_trampoline(JSContext *ctx, JSValueConst this_val,
 static PyObject *make_js_function(ContextObject *context, PyObject *callable,
                                   const char *name, int length)
 {
-    long id = context->next_cb_id++;
-    PyObject *key = PyLong_FromLong(id);
-    if (!key) {
-        return NULL;
-    }
-    if (PyDict_SetItem(context->callbacks, key, callable) < 0) {
-        Py_DECREF(key);
-        return NULL;
-    }
-    Py_DECREF(key);
-
     JSContext *ctx = context->ctx;
-    JSValue data = JS_NewInt32(ctx, (int32_t)id);
+
+    /* The host object owns one Python reference to `callable`; its
+     * finalizer Py_DECREFs when the JS GC reclaims it. */
+    PyObject *holder = make_py_host(context, callable);
+    if (!holder) {
+        return NULL;
+    }
+    JSValue data = JS_DupValue(ctx, ((ValueObject *)holder)->val);
+    Py_DECREF(holder);
     JSValue fn = JS_NewCFunctionData(ctx, js_trampoline, length, 0, 1, &data);
     JS_FreeValue(ctx, data);
     if (JS_IsException(fn)) {
@@ -988,40 +997,78 @@ static PyObject *Value_keys(ValueObject *self, PyObject *args)
     return list;
 }
 
-/* Build argv from a Python sequence. Caller frees with free_js_argv. */
-static JSValue *build_js_argv(ContextObject *context, PyObject *seq, int *argc)
+/* Most JS calls have very few arguments; a small stack buffer skips the
+ * PyMem_Malloc/Free pair for the common case. Tuples and lists short-circuit
+ * to borrowed-item access (PyTuple_GET_ITEM / PyList_GET_ITEM) so we also
+ * avoid the per-item PySequence_GetItem incref/decref pair. */
+#define JS_ARGV_STACK 8
+
+static JSValue *build_js_argv(ContextObject *context, PyObject *seq,
+                              JSValue *stackbuf, int stack_cap, int *argc)
 {
-    Py_ssize_t n = PySequence_Size(seq);
-    if (n < 0) {
-        return NULL;
+    Py_ssize_t n;
+    int is_tuple = PyTuple_CheckExact(seq);
+    int is_list = !is_tuple && PyList_CheckExact(seq);
+    if (is_tuple) {
+        n = PyTuple_GET_SIZE(seq);
+    } else if (is_list) {
+        n = PyList_GET_SIZE(seq);
+    } else {
+        n = PySequence_Size(seq);
+        if (n < 0) {
+            return NULL;
+        }
     }
-    JSValue *argv = PyMem_Malloc(sizeof(JSValue) * (n ? n : 1));
-    if (!argv) {
-        PyErr_NoMemory();
-        return NULL;
+    JSValue *argv;
+    if (n <= stack_cap) {
+        argv = stackbuf;
+    } else {
+        argv = PyMem_Malloc(sizeof(JSValue) * (size_t)n);
+        if (!argv) {
+            PyErr_NoMemory();
+            return NULL;
+        }
     }
     for (Py_ssize_t i = 0; i < n; i++) {
-        PyObject *item = PySequence_GetItem(seq, i);
-        if (!item || py_to_js(context, item, &argv[i]) < 0) {
+        PyObject *item;
+        int needs_decref;
+        if (is_tuple) {
+            item = PyTuple_GET_ITEM(seq, i);  /* borrowed */
+            needs_decref = 0;
+        } else if (is_list) {
+            item = PyList_GET_ITEM(seq, i);   /* borrowed */
+            needs_decref = 0;
+        } else {
+            item = PySequence_GetItem(seq, i); /* new ref */
+            needs_decref = 1;
+        }
+        int rc = item ? py_to_js(context, item, &argv[i]) : -1;
+        if (needs_decref) {
             Py_XDECREF(item);
+        }
+        if (rc < 0) {
             for (Py_ssize_t j = 0; j < i; j++) {
                 JS_FreeValue(context->ctx, argv[j]);
             }
-            PyMem_Free(argv);
+            if (argv != stackbuf) {
+                PyMem_Free(argv);
+            }
             return NULL;
         }
-        Py_DECREF(item);
     }
     *argc = (int)n;
     return argv;
 }
 
-static void free_js_argv(ContextObject *context, JSValue *argv, int argc)
+static void free_js_argv(ContextObject *context, JSValue *argv,
+                         JSValue *stackbuf, int argc)
 {
     for (int i = 0; i < argc; i++) {
         JS_FreeValue(context->ctx, argv[i]);
     }
-    PyMem_Free(argv);
+    if (argv != stackbuf) {
+        PyMem_Free(argv);
+    }
 }
 
 static PyObject *Value_call(ValueObject *self, PyObject *args, PyObject *kwds)
@@ -1043,14 +1090,16 @@ static PyObject *Value_call(ValueObject *self, PyObject *args, PyObject *kwds)
         return NULL;
     }
     int argc = 0;
-    JSValue *argv = build_js_argv(self->context, args, &argc);
+    JSValue stackbuf[JS_ARGV_STACK];
+    JSValue *argv = build_js_argv(self->context, args, stackbuf,
+                                  JS_ARGV_STACK, &argc);
     if (!argv) {
         JS_FreeValue(ctx, js_this);
         return NULL;
     }
     JSValue res = JS_Call(ctx, self->val, js_this, argc, argv);
     JS_FreeValue(ctx, js_this);
-    free_js_argv(self->context, argv, argc);
+    free_js_argv(self->context, argv, stackbuf, argc);
     if (JS_IsException(res)) {
         return raise_js_exception(self->context);
     }
@@ -1061,12 +1110,14 @@ static PyObject *Value_call_constructor(ValueObject *self, PyObject *args)
 {
     JSContext *ctx = VALUE_CTX(self);
     int argc = 0;
-    JSValue *argv = build_js_argv(self->context, args, &argc);
+    JSValue stackbuf[JS_ARGV_STACK];
+    JSValue *argv = build_js_argv(self->context, args, stackbuf,
+                                  JS_ARGV_STACK, &argc);
     if (!argv) {
         return NULL;
     }
     JSValue res = JS_CallConstructor(ctx, self->val, argc, argv);
-    free_js_argv(self->context, argv, argc);
+    free_js_argv(self->context, argv, stackbuf, argc);
     if (JS_IsException(res)) {
         return raise_js_exception(self->context);
     }
@@ -1184,7 +1235,8 @@ static PyObject *Value_define_property(ValueObject *self, PyObject *args,
 static Py_ssize_t Value_length(ValueObject *self)
 {
     JSContext *ctx = VALUE_CTX(self);
-    JSValue len = JS_GetPropertyStr(ctx, self->val, "length");
+    JSValue len = JS_GetProperty(ctx, self->val,
+                                 self->context->runtime->atom_length);
     if (JS_IsException(len)) {
         raise_js_exception(self->context);
         return -1;
@@ -1314,12 +1366,40 @@ static PyTypeObject Value_Type = {
 /* Context object                                                       */
 /* ------------------------------------------------------------------ */
 
+/* Lazily populate the runtime-wide atom cache. Atoms are per-runtime in
+ * QuickJS; creating them once and reusing the handle replaces the
+ * JS_NewAtom/JS_FreeAtom dance in property-access hot paths. */
+static int runtime_init_atoms(RuntimeObject *runtime, JSContext *ctx)
+{
+    if (runtime->atom_length != JS_ATOM_NULL) {
+        return 0;
+    }
+    runtime->atom_length = JS_NewAtom(ctx, "length");
+    runtime->atom_name   = JS_NewAtom(ctx, "name");
+    runtime->atom_stack  = JS_NewAtom(ctx, "stack");
+    runtime->atom_value  = JS_NewAtom(ctx, "value");
+    runtime->atom_BigInt = JS_NewAtom(ctx, "BigInt");
+    if (runtime->atom_length == JS_ATOM_NULL ||
+        runtime->atom_name   == JS_ATOM_NULL ||
+        runtime->atom_stack  == JS_ATOM_NULL ||
+        runtime->atom_value  == JS_ATOM_NULL ||
+        runtime->atom_BigInt == JS_ATOM_NULL) {
+        PyErr_SetString(QuickJSError, "failed to intern QuickJS atoms");
+        return -1;
+    }
+    return 0;
+}
+
 /* Create a ContextObject bound to `runtime` (new reference). */
 static PyObject *make_context(RuntimeObject *runtime)
 {
     JSContext *ctx = JS_NewContext(runtime->rt);
     if (!ctx) {
         PyErr_SetString(QuickJSError, "failed to create QuickJS context");
+        return NULL;
+    }
+    if (runtime_init_atoms(runtime, ctx) < 0) {
+        JS_FreeContext(ctx);
         return NULL;
     }
     ContextObject *context = PyObject_New(ContextObject, &Context_Type);
@@ -1330,15 +1410,19 @@ static PyObject *make_context(RuntimeObject *runtime)
     context->ctx = ctx;
     context->runtime = runtime;
     Py_INCREF(runtime);
-    context->next_cb_id = 0;
     context->module_loader = NULL;
-    context->callbacks = PyDict_New();
-    if (!context->callbacks) {
-        Py_DECREF(context);
-        return NULL;
-    }
+    context->global = JS_UNDEFINED;
     JS_SetContextOpaque(ctx, context);
     return (PyObject *)context;
+}
+
+/* Return a borrowed handle to the cached global object (do not free). */
+static JSValueConst context_global(ContextObject *self)
+{
+    if (JS_IsUndefined(self->global)) {
+        self->global = JS_GetGlobalObject(self->ctx);
+    }
+    return self->global;
 }
 
 static PyObject *Context_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
@@ -1369,9 +1453,11 @@ static PyObject *Context_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
 static void Context_dealloc(ContextObject *self)
 {
     if (self->ctx) {
+        if (!JS_IsUndefined(self->global)) {
+            JS_FreeValue(self->ctx, self->global);
+        }
         JS_FreeContext(self->ctx);
     }
-    Py_XDECREF(self->callbacks);
     Py_XDECREF(self->module_loader);
     Py_XDECREF(self->runtime);
     PyObject_Free(self);
@@ -1440,7 +1526,8 @@ static PyObject *Context_async_eval(ContextObject *self, PyObject *args,
             return NULL;
         }
         JS_FreeValue(self->ctx, res);
-        JSValue inner = JS_GetPropertyStr(self->ctx, settled, "value");
+        JSValue inner = JS_GetProperty(self->ctx, settled,
+                                       self->runtime->atom_value);
         JS_FreeValue(self->ctx, settled);
         if (JS_IsException(inner)) {
             return raise_js_exception(self);
@@ -1492,7 +1579,7 @@ static PyObject *Context_await_promise(ContextObject *self, PyObject *args)
 
 static PyObject *Context_get_global(ContextObject *self, PyObject *args)
 {
-    return Value_wrap(self, JS_GetGlobalObject(self->ctx));
+    return Value_wrap(self, JS_DupValue(self->ctx, context_global(self)));
 }
 
 static PyObject *Context_get(ContextObject *self, PyObject *args)
@@ -1501,9 +1588,7 @@ static PyObject *Context_get(ContextObject *self, PyObject *args)
     if (!PyArg_ParseTuple(args, "s:get", &name)) {
         return NULL;
     }
-    JSValue global = JS_GetGlobalObject(self->ctx);
-    JSValue v = JS_GetPropertyStr(self->ctx, global, name);
-    JS_FreeValue(self->ctx, global);
+    JSValue v = JS_GetPropertyStr(self->ctx, context_global(self), name);
     if (JS_IsException(v)) {
         return raise_js_exception(self);
     }
@@ -1521,9 +1606,7 @@ static PyObject *Context_set(ContextObject *self, PyObject *args)
     if (py_to_js(self, value, &jv) < 0) {
         return NULL;
     }
-    JSValue global = JS_GetGlobalObject(self->ctx);
-    int r = JS_SetPropertyStr(self->ctx, global, name, jv);
-    JS_FreeValue(self->ctx, global);
+    int r = JS_SetPropertyStr(self->ctx, context_global(self), name, jv);
     if (r < 0) {
         return raise_js_exception(self);
     }
@@ -1821,6 +1904,11 @@ static PyObject *Runtime_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         return NULL;
     }
     self->interrupt_cb = NULL;
+    self->atom_length = JS_ATOM_NULL;
+    self->atom_name   = JS_ATOM_NULL;
+    self->atom_stack  = JS_ATOM_NULL;
+    self->atom_value  = JS_ATOM_NULL;
+    self->atom_BigInt = JS_ATOM_NULL;
     JS_SetRuntimeOpaque(self->rt, self);
     /* Register the host-object class so Python objects can be embedded. */
     JS_NewClass(self->rt, py_host_class_id, &py_host_class_def);
@@ -1831,6 +1919,13 @@ static void Runtime_dealloc(RuntimeObject *self)
 {
     Py_XDECREF(self->interrupt_cb);
     if (self->rt) {
+        if (self->atom_length != JS_ATOM_NULL) {
+            JS_FreeAtomRT(self->rt, self->atom_length);
+            JS_FreeAtomRT(self->rt, self->atom_name);
+            JS_FreeAtomRT(self->rt, self->atom_stack);
+            JS_FreeAtomRT(self->rt, self->atom_value);
+            JS_FreeAtomRT(self->rt, self->atom_BigInt);
+        }
         JS_FreeRuntime(self->rt);
     }
     Py_TYPE(self)->tp_free((PyObject *)self);

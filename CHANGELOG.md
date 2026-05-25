@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Python callables exposed to JS are now anchored to the JS function via an
+  opaque host-object holder in `func_data` instead of a per-context dict
+  registry. This (a) frees the Python callable when the JS function is GC'd
+  rather than only when the whole Context dies, and (b) replaces a
+  PyLong/PyDict lookup with a single `JS_GetOpaque` on every JS->Python
+  trampoline call.
+- `Value.call` / `Value.call_constructor` build their argv in a small stack
+  buffer (≤8 args) and use borrowed item access for tuples/lists, skipping
+  `PyMem_Malloc` and per-argument `PySequence_GetItem` refcounting on the
+  common path.
+- Common atoms (`length`, `name`, `stack`, `value`, `BigInt`) are interned
+  once per `Runtime` and reused everywhere they were previously created via
+  `JS_GetPropertyStr`. The global object is also cached per `Context`, so
+  `ctx.get` / `ctx.set` and the BigInt fallback no longer round-trip through
+  `JS_GetGlobalObject` on every call.
+
 ### Added
 
 - `Context.async_eval(code, ...)` and the top-level `quickjs.async_eval()`
