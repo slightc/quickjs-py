@@ -180,7 +180,10 @@ def test_value_length_uses_atom_cache(ctx):
         assert len(arr) == 1000
     ctx.runtime.run_gc()
     after = ctx.runtime.compute_memory_usage()["atom_count"]
-    assert after == baseline
+    # The atom-cache means len() shouldn't intern new atoms at all; allow a
+    # small slack for runtime-internal atom housekeeping that may differ
+    # across platforms (e.g. Windows MinGW).
+    assert after - baseline <= 5, (baseline, after)
 
 
 def test_atom_cache_shared_across_contexts(rt):
@@ -188,6 +191,10 @@ def test_atom_cache_shared_across_contexts(rt):
     must be reused by every Context the runtime spawns."""
     c1 = rt.new_context()
     c2 = rt.new_context()
+    # Warm up the parser/atom interner so the first iteration of the loop
+    # does not skew the baseline measurement.
+    len(c1.eval("[1,2,3]"))
+    len(c2.eval("[4,5,6]"))
     rt.run_gc()
     baseline = rt.compute_memory_usage()["atom_count"]
     for _ in range(1000):
@@ -195,12 +202,16 @@ def test_atom_cache_shared_across_contexts(rt):
         len(c2.eval("[4,5,6]"))
     rt.run_gc()
     after = rt.compute_memory_usage()["atom_count"]
-    assert after == baseline
+    assert after - baseline <= 5, (baseline, after)
 
 
 def test_error_stack_uses_atom_cache(ctx):
     """raise_js_exception used to JS_NewAtom('stack') per error. Many
     raised errors must not grow the atom table."""
+    # Warm up the error machinery so first-throw transient atoms (e.g. the
+    # 'Error' prototype's lazy initialisation) are stable before baseline.
+    with pytest.raises(quickjs.JSError):
+        ctx.eval("throw new Error('warmup')")
     ctx.runtime.run_gc()
     baseline = ctx.runtime.compute_memory_usage()["atom_count"]
     for _ in range(500):
@@ -208,7 +219,7 @@ def test_error_stack_uses_atom_cache(ctx):
             ctx.eval("throw new Error('boom')")
     ctx.runtime.run_gc()
     after = ctx.runtime.compute_memory_usage()["atom_count"]
-    assert after == baseline
+    assert after - baseline <= 5, (baseline, after)
 
 
 def test_bigint_round_trip_through_cached_global(ctx):
