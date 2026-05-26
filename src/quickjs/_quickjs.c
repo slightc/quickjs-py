@@ -670,10 +670,6 @@ static char *js_module_normalize(JSContext *ctx, const char *base_name,
                                  const char *name, void *opaque)
 {
     ContextObject *context = (ContextObject *)JS_GetContextOpaque(ctx);
-    if (!context || !context->module_normalizer) {
-        /* Fall back to QuickJS's default name resolution. */
-        return js_strdup(ctx, name);
-    }
     PyObject *res = PyObject_CallFunction(context->module_normalizer, "ss",
                                           base_name, name);
     if (!res) {
