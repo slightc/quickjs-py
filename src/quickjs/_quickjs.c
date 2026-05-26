@@ -39,6 +39,7 @@ typedef struct {
     JSContext *ctx;
     RuntimeObject *runtime;
     PyObject *module_loader; /* callable(name) -> source str, or NULL */
+    PyObject *module_normalizer; /* callable(base, name) -> str, or NULL */
     /* Cached global object: JS_GetGlobalObject otherwise dups + frees on
      * every ctx.get/ctx.set. JS_UNDEFINED until first use. */
     JSValue global;
@@ -664,6 +665,54 @@ static PyObject *make_py_host(ContextObject *context, PyObject *obj)
 /* ------------------------------------------------------------------ */
 /* ES module loader trampoline                                          */
 /* ------------------------------------------------------------------ */
+
+static char *js_module_normalize(JSContext *ctx, const char *base_name,
+                                 const char *name, void *opaque)
+{
+    ContextObject *context = (ContextObject *)JS_GetContextOpaque(ctx);
+    if (!context || !context->module_normalizer) {
+        /* Fall back to QuickJS's default name resolution. */
+        return js_strdup(ctx, name);
+    }
+    PyObject *res = PyObject_CallFunction(context->module_normalizer, "ss",
+                                          base_name, name);
+    if (!res) {
+        PyObject *value = NULL, *type = NULL, *tb = NULL;
+        PyErr_Fetch(&type, &value, &tb);
+        PyObject *msg = value ? PyObject_Str(value) : NULL;
+        const char *cmsg = msg ? PyUnicode_AsUTF8(msg) : NULL;
+        JS_ThrowReferenceError(ctx,
+                               "module normalizer failed for '%s' (base '%s'): %s",
+                               name, base_name, cmsg ? cmsg : "error");
+        Py_XDECREF(msg);
+        Py_XDECREF(type);
+        Py_XDECREF(value);
+        Py_XDECREF(tb);
+        return NULL;
+    }
+    if (!PyUnicode_Check(res)) {
+        Py_DECREF(res);
+        JS_ThrowTypeError(ctx, "module normalizer must return a string");
+        return NULL;
+    }
+    Py_ssize_t out_len;
+    const char *out = PyUnicode_AsUTF8AndSize(res, &out_len);
+    if (!out) {
+        Py_DECREF(res);
+        PyErr_Clear();
+        JS_ThrowTypeError(ctx, "module normalizer returned invalid utf-8");
+        return NULL;
+    }
+    char *dup = js_malloc(ctx, (size_t)out_len + 1);
+    if (!dup) {
+        Py_DECREF(res);
+        return NULL;
+    }
+    memcpy(dup, out, (size_t)out_len);
+    dup[out_len] = '\0';
+    Py_DECREF(res);
+    return dup;
+}
 
 static JSModuleDef *js_module_loader(JSContext *ctx, const char *module_name,
                                      void *opaque)
@@ -1411,6 +1460,7 @@ static PyObject *make_context(RuntimeObject *runtime)
     context->runtime = runtime;
     Py_INCREF(runtime);
     context->module_loader = NULL;
+    context->module_normalizer = NULL;
     context->global = JS_UNDEFINED;
     JS_SetContextOpaque(ctx, context);
     return (PyObject *)context;
@@ -1459,6 +1509,7 @@ static void Context_dealloc(ContextObject *self)
         JS_FreeContext(self->ctx);
     }
     Py_XDECREF(self->module_loader);
+    Py_XDECREF(self->module_normalizer);
     Py_XDECREF(self->runtime);
     PyObject_Free(self);
 }
@@ -1768,6 +1819,24 @@ static PyObject *Context_new_host_object(ContextObject *self, PyObject *args)
     return make_py_host(self, obj);
 }
 
+/* Reinstall the runtime-level module callbacks based on which Python hooks
+ * are currently set. The loader can be unset while a normalizer is set; in
+ * that case the loader trampoline still runs and reports "no module loader
+ * set" with the canonical name produced by the normalizer. */
+static void context_refresh_module_hooks(ContextObject *self)
+{
+    JSModuleNormalizeFunc *nf = self->module_normalizer ? js_module_normalize
+                                                        : NULL;
+    JSModuleLoaderFunc *lf =
+        (self->module_loader || self->module_normalizer) ? js_module_loader
+                                                         : NULL;
+    if (!nf && !lf) {
+        JS_SetModuleLoaderFunc(self->runtime->rt, NULL, NULL, NULL);
+    } else {
+        JS_SetModuleLoaderFunc(self->runtime->rt, nf, lf, NULL);
+    }
+}
+
 /* Install a callable(module_name) -> source-string ES module loader. */
 static PyObject *Context_set_module_loader(ContextObject *self, PyObject *args)
 {
@@ -1775,20 +1844,42 @@ static PyObject *Context_set_module_loader(ContextObject *self, PyObject *args)
     if (!PyArg_ParseTuple(args, "O:set_module_loader", &loader)) {
         return NULL;
     }
+    if (loader != Py_None && !PyCallable_Check(loader)) {
+        PyErr_SetString(PyExc_TypeError, "loader must be callable or None");
+        return NULL;
+    }
     Py_XDECREF(self->module_loader);
     if (loader == Py_None) {
         self->module_loader = NULL;
-        JS_SetModuleLoaderFunc(self->runtime->rt, NULL, NULL, NULL);
     } else {
-        if (!PyCallable_Check(loader)) {
-            PyErr_SetString(PyExc_TypeError, "loader must be callable or None");
-            self->module_loader = NULL;
-            return NULL;
-        }
         Py_INCREF(loader);
         self->module_loader = loader;
-        JS_SetModuleLoaderFunc(self->runtime->rt, NULL, js_module_loader, NULL);
     }
+    context_refresh_module_hooks(self);
+    Py_RETURN_NONE;
+}
+
+/* Install a callable(base_name, name) -> str ES module name resolver. */
+static PyObject *Context_set_module_normalizer(ContextObject *self,
+                                               PyObject *args)
+{
+    PyObject *normalizer;
+    if (!PyArg_ParseTuple(args, "O:set_module_normalizer", &normalizer)) {
+        return NULL;
+    }
+    if (normalizer != Py_None && !PyCallable_Check(normalizer)) {
+        PyErr_SetString(PyExc_TypeError,
+                        "normalizer must be callable or None");
+        return NULL;
+    }
+    Py_XDECREF(self->module_normalizer);
+    if (normalizer == Py_None) {
+        self->module_normalizer = NULL;
+    } else {
+        Py_INCREF(normalizer);
+        self->module_normalizer = normalizer;
+    }
+    context_refresh_module_hooks(self);
     Py_RETURN_NONE;
 }
 
@@ -1847,6 +1938,11 @@ static PyMethodDef Context_methods[] = {
      "new_host_object(obj) -> opaque JS object embedding a Python object"},
     {"set_module_loader", (PyCFunction)Context_set_module_loader, METH_VARARGS,
      "set_module_loader(callable_or_None): resolve ES module sources."},
+    {"set_module_normalizer", (PyCFunction)Context_set_module_normalizer,
+     METH_VARARGS,
+     "set_module_normalizer(callable_or_None): map (base_name, name) to a "
+     "canonical module name. Replaces QuickJS's default relative-path "
+     "resolver."},
     {"__enter__", (PyCFunction)Context_enter, METH_NOARGS, NULL},
     {"__exit__", (PyCFunction)Context_exit, METH_VARARGS, NULL},
     {NULL}

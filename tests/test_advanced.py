@@ -158,6 +158,60 @@ def test_module_loader_can_be_cleared(ctx):
         ctx.eval("import { v } from 'any';", module=True)
 
 
+def test_module_normalizer_resolves_relative_imports(ctx):
+    sources = {
+        "math": "export * from './sin';",
+        "math/sin": "export function sin(x) { return x; }",
+    }
+    calls = []
+
+    def normalizer(base, name):
+        calls.append((base, name))
+        if name.startswith("./"):
+            base_dir = base.rsplit("/", 1)[0] if "/" in base else base
+            return f"{base_dir}/{name[2:]}" if base_dir else name[2:]
+        return name
+
+    ctx.set_module_loader(lambda name: sources.get(name))
+    ctx.set_module_normalizer(normalizer)
+    ctx.eval(
+        "import { sin } from 'math'; globalThis.r = sin(0.5);",
+        module=True,
+    )
+    assert ctx.get("r") == 0.5
+    assert ("math", "./sin") in calls
+
+
+def test_module_normalizer_can_be_cleared(ctx):
+    ctx.set_module_normalizer(lambda base, name: name)
+    ctx.set_module_normalizer(None)
+    ctx.set_module_loader(lambda name: "export const v = 7;")
+    ctx.eval("import { v } from 'm'; globalThis.r = v;", module=True)
+    assert ctx.get("r") == 7
+
+
+def test_module_normalizer_must_be_callable(ctx):
+    with pytest.raises(TypeError):
+        ctx.set_module_normalizer(42)
+
+
+def test_module_normalizer_string_required(ctx):
+    ctx.set_module_loader(lambda name: "export const v = 1;")
+    ctx.set_module_normalizer(lambda base, name: 123)
+    with pytest.raises(quickjs.JSError):
+        ctx.eval("import { v } from 'm';", module=True)
+
+
+def test_module_normalizer_exception_propagates(ctx):
+    def boom(base, name):
+        raise RuntimeError("nope")
+
+    ctx.set_module_loader(lambda name: "export const v = 1;")
+    ctx.set_module_normalizer(boom)
+    with pytest.raises(quickjs.JSError):
+        ctx.eval("import { v } from 'm';", module=True)
+
+
 # --- get_exception ------------------------------------------------------
 
 
