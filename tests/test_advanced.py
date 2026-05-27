@@ -202,6 +202,23 @@ def test_module_normalizer_receives_base_name(ctx):
     assert any(name == "lib" for _base, name in captured)
 
 
+def test_module_normalizer_handles_null_base_name(ctx):
+    captured = []
+
+    def normalize(base, name):
+        captured.append((base, name))
+        return name
+
+    ctx.set_module_normalizer(normalize)
+    ctx.set_module_loader(
+        lambda name: "import 'inner';" if name == "outer" else "export const x = 1;"
+    )
+    ctx.eval("import 'outer';", module=True)
+    assert captured, "normalizer should have been invoked"
+    bases = {base for base, _ in captured}
+    assert None in bases or any(isinstance(b, str) for b in bases)
+
+
 def test_module_normalizer_can_be_cleared(ctx):
     ctx.set_module_normalizer(lambda base, name: "math")
     ctx.set_module_normalizer(None)

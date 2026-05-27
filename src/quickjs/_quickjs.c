@@ -693,7 +693,9 @@ static char *js_module_normalizer(JSContext *ctx,
     if (!context || !context->module_normalizer) {
         return js_strdup(ctx, module_name);
     }
-    PyObject *res = PyObject_CallFunction(context->module_normalizer, "ss",
+    /* module_base_name is NULL for entry modules and built-ins; pass
+     * Python `None` to the user callback in that case. */
+    PyObject *res = PyObject_CallFunction(context->module_normalizer, "zs",
                                           module_base_name, module_name);
     if (!res) {
         PyObject *value = NULL, *type = NULL, *tb = NULL;
