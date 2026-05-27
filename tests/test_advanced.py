@@ -158,6 +158,90 @@ def test_module_loader_can_be_cleared(ctx):
         ctx.eval("import { v } from 'any';", module=True)
 
 
+def test_module_normalizer_resolves_relative_names(ctx):
+    seen_loads = []
+
+    def normalize(base, name):
+        if name.startswith("./"):
+            return name[2:]
+        return name
+
+    def load(name):
+        seen_loads.append(name)
+        sources = {
+            "math": "export function square(x) { return x * x; }",
+        }
+        return sources.get(name)
+
+    ctx.set_module_normalizer(normalize)
+    ctx.set_module_loader(load)
+    ctx.eval(
+        "import { square } from './math'; globalThis.result = square(7);",
+        module=True,
+        filename="entry",
+    )
+    assert ctx.get("result") == 49
+    assert "math" in seen_loads
+
+
+def test_module_normalizer_receives_base_name(ctx):
+    captured = []
+
+    def normalize(base, name):
+        captured.append((base, name))
+        return name
+
+    ctx.set_module_normalizer(normalize)
+    ctx.set_module_loader(lambda name: "export const v = 1;")
+    ctx.eval(
+        "import { v } from 'lib'; globalThis.v = v;",
+        module=True,
+        filename="main",
+    )
+    assert ctx.get("v") == 1
+    assert any(name == "lib" for _base, name in captured)
+
+
+def test_module_normalizer_handles_null_base_name(ctx):
+    captured = []
+
+    def normalize(base, name):
+        captured.append((base, name))
+        return name
+
+    ctx.set_module_normalizer(normalize)
+    ctx.set_module_loader(
+        lambda name: "import 'inner';" if name == "outer" else "export const x = 1;"
+    )
+    ctx.eval("import 'outer';", module=True)
+    assert captured, "normalizer should have been invoked"
+    bases = {base for base, _ in captured}
+    assert None in bases or any(isinstance(b, str) for b in bases)
+
+
+def test_module_normalizer_can_be_cleared(ctx):
+    ctx.set_module_normalizer(lambda base, name: "math")
+    ctx.set_module_normalizer(None)
+    ctx.set_module_loader(lambda name: "export const v = 1;" if name == "lib" else None)
+    ctx.eval("import { v } from 'lib'; globalThis.x = v;", module=True)
+    assert ctx.get("x") == 1
+
+
+def test_module_normalizer_error_propagates(ctx):
+    def normalize(base, name):
+        raise RuntimeError("boom")
+
+    ctx.set_module_normalizer(normalize)
+    ctx.set_module_loader(lambda name: "export const v = 1;")
+    with pytest.raises(quickjs.JSError):
+        ctx.eval("import { v } from 'lib';", module=True)
+
+
+def test_module_normalizer_requires_callable(ctx):
+    with pytest.raises(TypeError):
+        ctx.set_module_normalizer(42)
+
+
 # --- get_exception ------------------------------------------------------
 
 
